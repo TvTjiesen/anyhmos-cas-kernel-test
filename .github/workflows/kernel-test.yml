@@ -1,0 +1,84 @@
+name: cas-4.19-hmos-ipc-compile-test
+
+# 目标：在 Linux 4.19.325（小米 10 Ultra / cas 的内核树）上，
+# 尝试编译 anyhmos（小米平板 6S Pro / 鸿蒙7）的 compat/ipc 内核模块。
+#
+# 判定标准：
+#   编译成功      -> 鸿蒙 IPC 可在 4.19 上实现，项目继续
+#   编译失败      -> 查看缺失接口，评估 backport 成本
+#
+# 本 workflow 只编译，不解锁、不刷写任何设备。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            python3 gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: 拉取 cas 内核（LineageOS sm8250, lineage-23.2）
+        run: |
+          git clone --depth 1 -b lineage-23.2 \
+            https://github.com/LineageOS/android_kernel_xiaomi_sm8250.git ksrc
+          cd ksrc
+          echo "==== 内核版本 ===="
+          head -6 Makefile
+
+      - name: 生成配置（kona_defconfig + xiaomi/cas.config）
+        run: |
+          set -e
+          cd ksrc
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out vendor/kona_defconfig
+          scripts/kconfig/merge_config.sh -O out \
+            out/.config arch/arm64/configs/vendor/xiaomi/cas.config || true
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out olddefconfig
+
+      - name: 内核准备（生成头文件与符号）
+        run: |
+          cd ksrc
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out prepare modules_prepare -j$(nproc)
+
+      - name: 编译鸿蒙 IPC 模块（允许失败，用于采集错误）
+        continue-on-error: true
+        run: |
+          cd ksrc
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out \
+            M=$GITHUB_WORKSPACE/hmos_ipc KBUILD_MODPOST_WARN=1 modules \
+            -j$(nproc) 2>&1 | tee $GITHUB_WORKSPACE/build.log
+
+      - name: 汇总结果
+        run: |
+          echo "================ 结果 ================"
+          if grep -q "sheng_hmos_ipc.ko" build.log 2>/dev/null; then
+            echo "RESULT: BUILD_OK"
+          else
+            echo "RESULT: BUILD_FAILED"
+          fi
+          echo "---- error 数量 ----"
+          grep -c "error:" build.log 2>/dev/null || echo 0
+          echo "---- 前 100 条 error ----"
+          grep "error:" build.log 2>/dev/null | head -100 || true
+          echo "---- 前 30 条 warning（可能提示 API 缺失）----"
+          grep -i "warning:" build.log 2>/dev/null | head -30 || true
+
+      - name: 上传完整日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
