@@ -105,7 +105,23 @@ scripts/config --file out/.config \
   -e EROFS_FS -e EROFS_FS_XATTR -e EROFS_FS_SECURITY \
   -e BLK_DEV_LOOP -e PID_NS -e USER_NS -e FAIR_GROUP_SCHED \
   -e QCOM_KGSL   -e U_SERIAL_CONSOLE -e USB_G_SERIAL -e USB_ACM -e USB_CONFIGFS_ACM   -e SECURITY_SELINUX_BOOTPARAM -e SECURITY_SELINUX_DISABLE   --set-str CMDLINE "cgroup_disable=pressure ramoops_memreserve=4M console=ttyGS0,115200 ignore_loglevel selinux=0" 2>&1 | tail -20
+log "=== 4b. enable the SDE/MDSS display stack ==="
+# round-026: the running kernel has CONFIG_DRM_MSM unset, so cas' mdss@1c00000
+# node has no driver at all -- zero msm_drm lines in kmsg, no /dev/dri/card0,
+# no /sys/class/backlight/panel0-backlight. techpack/display/msm only builds
+# via obj-$(CONFIG_DRM_MSM), so HarmonyOS' composer_host / render_service can
+# never get a real screen. Nothing else in the recipe enabled it: neither
+# kona-perf_defconfig nor sm8250-common.config nor cas.config mentions DRM_MSM.
+scripts/config --file out/.config \
+  -e DRM -e DRM_KMS_HELPER -e DRM_PANEL \
+  -e DRM_MSM -e DRM_MSM_SDE -e DRM_MSM_DSI -e DRM_MSM_DP \
+  -e QCOM_MDSS_PLL -e MSM_SDE_ROTATOR \
+  -e DRM_FBDEV_EMULATION 2>&1 | tail -20
+
 make O=out ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig 2>&1 | tail -15
+log "--- display config after olddefconfig ---"
+grep -E 'CONFIG_(DRM|DRM_MSM|DRM_MSM_SDE|DRM_MSM_DSI|DRM_MSM_DP|QCOM_MDSS_PLL|MSM_SDE_ROTATOR|DRM_FBDEV_EMULATION|DRM_PANEL)=' out/.config >> "$REPORT" || true
+grep -E '^# CONFIG_DRM_MSM is not set' out/.config >> "$REPORT" || log "DRM_MSM is enabled"
 log "--- key config values ---"
 grep -E 'CONFIG_(ARCH_QCOM|COMPAT|ACCESS_TOKENID|BINDER_SENDER_INFO|FS_VERITY|EROFS_FS|ANDROID_BINDERFS|QCOM_KGSL|CRYPTO_ECDSA|CRYPTO_ECC|BLK_DEV_LOOP)=' out/.config >> "$REPORT" || true
 # USB gadget serial console: this is how the 6.7 s -> reset window becomes visible.
@@ -122,6 +138,11 @@ make -j"$(nproc)" O=out ARCH=arm64 CROSS_COMPILE="$CROSS" \
   KCFLAGS="-Wno-error -Wno-attribute-alias" Image.gz-dtb 2>&1 | tee "$ROOT/build.log"
 RC=${PIPESTATUS[0]}
 log "build rc=$RC"
+log "display objects: techpack/msm=$(ls out/techpack/display/msm/*.o 2>/dev/null | wc -l) drm/msm=$(ls out/drivers/gpu/drm/msm/*.o 2>/dev/null | wc -l)"
+if [ "$RC" -ne 0 ]; then
+  log "--- first build errors (full log in build.log artifact) ---"
+  grep -E 'error:|Error [0-9]+|No such file or directory' "$ROOT/build.log" | head -40 >> "$REPORT" || true
+fi
 
 log "=== 6. collect experiment artifacts (BEFORE touching the config) ==="
 cp out/arch/arm64/boot/Image.gz-dtb "$ART/Image.gz-dtb" 2>/dev/null || log "WARN no Image.gz-dtb"
