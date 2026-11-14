@@ -1,0 +1,52 @@
+name: publish-kernel
+
+# The Actions artifact CDN (productionresultssa*.blob.core.windows.net) is not
+# reachable from the development machine, while github.com and the release CDN
+# are. This job copies the kernel artifacts of a finished build run into a
+# release, which gives a plain https://github.com/.../releases/download/... URL.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "workflow run id to publish"
+        required: true
+        default: "43613598788"
+      tag:
+        description: "release tag"
+        required: true
+        default: "h6-kernel-run6"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: fetch artifact of the given run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ID=$(gh api "repos/${{ github.repository }}/actions/runs/${{ inputs.run_id }}/artifacts" \
+               --jq '.artifacts[] | select(.name=="cas-h6-kernel") | .id')
+          echo "artifact id = $ID"
+          test -n "$ID"
+          curl -sSL --retry 5 --retry-delay 3 \
+            -H "Authorization: token $GH_TOKEN" \
+            -o k.zip "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$ID/zip"
+          ls -l k.zip
+          mkdir -p art && unzip -o k.zip -d art
+          ls -l art
+
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release delete "${{ inputs.tag }}" --yes --cleanup-tag || true
+          gh release create "${{ inputs.tag }}" \
+            art/Image art/kernel.config art/apply-report.txt \
+            --title "${{ inputs.tag }}" \
+            --notes "kernel Image + .config + build report for run ${{ inputs.run_id }}"
