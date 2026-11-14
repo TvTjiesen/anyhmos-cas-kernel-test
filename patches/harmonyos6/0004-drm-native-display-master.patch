@@ -1,0 +1,20 @@
+--- a/drivers/gpu/drm/drm_ioctl.c
++++ b/drivers/gpu/drm/drm_ioctl.c
+@@ -754,6 +754,17 @@
+ 	if (drm_dev_is_unplugged(dev))
+ 		return -ENODEV;
+ 
++	/* Experimental H6 y2q: native display services own DRM without
++	 * CAP_SYS_ADMIN. Limit SET/DROP_MASTER to their audited native UIDs;
++	 * all other ioctls and callers retain the original permission checks.
++	 * drm_setmaster_ioctl still enforces exclusive master ownership.
++	 */
++	if ((func == drm_setmaster_ioctl || func == drm_dropmaster_ioctl) &&
++	    (uid_eq(current_euid(), KUIDT_INIT(3036)) || /* composer_host */
++	     uid_eq(current_euid(), KUIDT_INIT(3041)) || /* allocator_host */
++	     uid_eq(current_euid(), KUIDT_INIT(1003))))  /* render_service */
++		flags &= ~DRM_ROOT_ONLY;
++
+ 	retcode = drm_ioctl_permit(flags, file_priv);
+ 	if (unlikely(retcode))
+ 		return retcode;

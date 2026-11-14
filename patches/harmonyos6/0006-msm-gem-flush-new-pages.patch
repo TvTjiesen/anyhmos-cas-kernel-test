@@ -1,0 +1,50 @@
+--- a/techpack/display/msm/msm_gem.c
++++ b/techpack/display/msm/msm_gem.c
+@@ -21,6 +21,7 @@
+ #include <linux/dma-buf.h>
+ #include <linux/pfn_t.h>
+ #include <linux/ion.h>
++#include <asm/cacheflush.h>
+ 
+ #include "msm_drv.h"
+ #include "msm_gem.h"
+@@ -74,6 +75,25 @@
+ 	return p;
+ }
+ 
++/*
++ * Objects that are not yet attached to an address space (e.g. dumb buffers
++ * exported through PRIME and rendered by KGSL) have no aspace device, and
++ * dma_sync_sg_for_device(NULL, ...) resolves to dummy_dma_ops on arm64, which
++ * performs no cache maintenance. The shmem zeroing then stays in dirty CPU
++ * cache lines that are written back over the non-coherent GPU/display output
++ * later, showing up as 64-byte black runs. Clean the new pages to PoC here.
++ */
++static void msm_gem_flush_new_pages(struct sg_table *sgt)
++{
++#ifdef CONFIG_ARM64
++	struct scatterlist *sg;
++	int i;
++
++	for_each_sg(sgt->sgl, sg, sgt->nents, i)
++		__dma_flush_area(sg_virt(sg), sg->length);
++#endif
++}
++
+ static struct page **get_pages(struct drm_gem_object *obj)
+ {
+ 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+@@ -115,8 +135,11 @@
+ 		 */
+ 		if (msm_obj->flags & (MSM_BO_WC|MSM_BO_UNCACHED)) {
+ 			aspace_dev = msm_gem_get_aspace_device(msm_obj->aspace);
+-			dma_sync_sg_for_device(aspace_dev, msm_obj->sgt->sgl,
+-				msm_obj->sgt->nents, DMA_BIDIRECTIONAL);
++			if (aspace_dev)
++				dma_sync_sg_for_device(aspace_dev, msm_obj->sgt->sgl,
++					msm_obj->sgt->nents, DMA_BIDIRECTIONAL);
++			else
++				msm_gem_flush_new_pages(msm_obj->sgt);
+ 		}
+ 	}
+ 

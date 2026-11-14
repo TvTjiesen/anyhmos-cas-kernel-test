@@ -1,0 +1,420 @@
+/* Experimental SM-G986N loop-backed HarmonyOS bring-up. GPL-2.0-only.
+ * Physical system/vendor/recovery/firmware partitions are never rewritten.
+ * The existing F2FS data hosts read-only donor files and separate H6 data files.
+ */
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <linux/loop.h>
+#include <linux/reboot.h>
+#include <poll.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <sys/xattr.h>
+#include <time.h>
+#include <unistd.h>
+#include <drm.h>
+#include <drm_mode.h>
+
+#ifndef H6_LOCAL_DESKTOP
+#define H6_LOCAL_DESKTOP 0
+#endif
+
+#ifndef H6_KEEP_RUNNING
+#define H6_KEEP_RUNNING 0
+#endif
+
+#ifndef H6_REFRESH_ICONS
+#define H6_REFRESH_ICONS 0
+#endif
+
+_Thread_local unsigned char tls_alignment __attribute__((aligned(64),used));
+static int kfd=-1;
+static void logmsg(const char *fmt,...)
+{
+    char b[1024];va_list ap;va_start(ap,fmt);
+    int n=vsnprintf(b,sizeof(b),fmt,ap);va_end(ap);
+    if(n>0 && kfd>=0)dprintf(kfd,"<3>h6-y2q: %s\n",b);
+}
+static __attribute__((noreturn)) void recovery(void)
+{
+    /* A stuck filesystem must not indefinitely block the recovery watchdog. */
+    pid_t child=fork();
+    if(child==0){sync();_exit(0);}
+    if(child>0){
+        for(int i=0;i<5;i++){
+            if(waitpid(child,NULL,WNOHANG)==child)break;
+            sleep(1);
+        }
+    }
+    syscall(SYS_reboot,LINUX_REBOOT_MAGIC1,LINUX_REBOOT_MAGIC2,
+            LINUX_REBOOT_CMD_RESTART2,"recovery");
+    logmsg("recovery syscall returned: %s",strerror(errno));
+    for(;;)sleep(10);
+}
+static int readtext(const char *path,char *buf,size_t size)
+{
+    int fd=open(path,O_RDONLY|O_CLOEXEC);if(fd<0)return -1;
+    ssize_t n=read(fd,buf,size-1);close(fd);if(n<0)return -1;buf[n]=0;return n;
+}
+static int partition_is(const char *dev,const char *part)
+{
+    char path[128],b[2048],want[128];
+    snprintf(path,sizeof(path),"/sys/class/block/%s/uevent",dev);
+    snprintf(want,sizeof(want),"PARTNAME=%s\n",part);
+    return readtext(path,b,sizeof(b))>=0 && strstr(b,want)!=NULL;
+}
+static int readtextat(int dirfd,const char *path,char *buf,size_t size)
+{
+    int fd=openat(dirfd,path,O_RDONLY|O_CLOEXEC);if(fd<0)return -1;
+    ssize_t n=read(fd,buf,size-1);close(fd);if(n<0)return -1;buf[n]=0;return n;
+}
+static void snapshot(int dirfd,int procfd,int sec)
+{
+    /* /proc/<pid>/cmdline can wait on another process's mm locks. Keep all
+     * snapshots out of the watchdog loop, with a bounded child lifetime. */
+    if(fork()!=0)return;
+    alarm(10);
+    char name[80],path[160],buf[4096];
+    snprintf(name,sizeof(name),"full-a25-processes-%d.txt",sec);
+    int out=openat(dirfd,name,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0600);
+    if(out<0)_exit(1);
+    DIR *d=fdopendir(openat(procfd,".",O_RDONLY|O_DIRECTORY|O_CLOEXEC));struct dirent *e;
+    if(d){while((e=readdir(d))){
+        if(e->d_name[0]<'0'||e->d_name[0]>'9')continue;
+        snprintf(path,sizeof(path),"%.20s/cmdline",e->d_name);
+        int n=readtextat(procfd,path,buf,sizeof(buf));
+        for(int i=0;i<n;i++)if(!buf[i])buf[i]=' ';
+        if(n>=0)dprintf(out,"%s %s\n",e->d_name,buf);
+        if(n>0 && (strstr(buf,"render_service") || strstr(buf,"com.ohos.sceneboard") || !strcmp(e->d_name,"1"))) {
+            snprintf(path,sizeof(path),"%.20s/environ",e->d_name);
+            n=readtextat(procfd,path,buf,sizeof(buf));
+            if(n<0)dprintf(out,"ENV %s error=%d\n",e->d_name,errno);
+            else for(int i=0;i<n;) {
+                size_t len=strnlen(buf+i,n-i);
+                if(!strncmp(buf+i,"IR3_SHADER_DEBUG=",17) || !strncmp(buf+i,"FD_MESA_DEBUG=",14) ||
+                   !strncmp(buf+i,"MESA_SHADER_CACHE_DISABLE=",26))
+                    dprintf(out,"ENV %s %.*s\n",e->d_name,(int)len,buf+i);
+                i+=(int)len+1;
+            }
+        }
+    }closedir(d);}
+    if(readtextat(procfd,"1/mounts",buf,sizeof(buf))>=0)dprintf(out,"\nPID 1 mounts:\n%s",buf);
+    fsync(out);close(out);_exit(0);
+}
+static void capture_command(int dir,int procfd,const char *name,char *const args[],int timeout)
+{
+    if(fork()!=0)return;
+    int out=openat(dir,name,O_WRONLY|O_CREAT|O_TRUNC,0600);
+    int root=openat(procfd,"1/root",O_RDONLY|O_DIRECTORY);
+    int ns=openat(procfd,"1/ns/mnt",O_RDONLY);
+    if(out<0||root<0||ns<0)_exit(120);
+    dup2(out,STDOUT_FILENO);dup2(out,STDERR_FILENO);
+    // PID 1 may start without standard fds. If openat returned fd 2,
+    // closing it here would silently discard every diagnostic on stderr.
+    if(out>STDERR_FILENO)close(out);
+    struct rlimit limit={64*1024*1024,64*1024*1024};setrlimit(RLIMIT_FSIZE,&limit);
+    if(timeout)alarm(timeout);
+    if(setns(ns,CLONE_NEWNS)||fchdir(root)||chroot(".")||chdir("/")){
+        dprintf(2,"capture root/namespace: %s\n",strerror(errno));_exit(121);
+    }
+    close(root);close(ns);setenv("PATH","/system/bin:/vendor/bin",1);
+    execv(args[0],args);dprintf(2,"exec %s: %s\n",args[0],strerror(errno));_exit(122);
+}
+static void start_logger(void)
+{
+    mkdir("/h6cache/harmonyos6",0700);
+    if(!H6_KEEP_RUNNING && access("/h6cache/harmonyos6/full-a25-inflight",F_OK)==0){
+        unlink("/h6cache/harmonyos6/full-a25-inflight");
+        logmsg("previous full-a25 boot did not finish; returning to recovery");recovery();
+    }
+    if(!H6_KEEP_RUNNING){
+        int mark=open("/h6cache/harmonyos6/full-a25-inflight",O_WRONLY|O_CREAT|O_TRUNC,0600);
+        if(mark<0)recovery();fsync(mark);close(mark);sync();
+    }
+    int ready[2];if(pipe2(ready,O_CLOEXEC))recovery();
+    pid_t p=fork();if(p<0)recovery();
+    if(p){close(ready[1]);char ok=0;int n=read(ready[0],&ok,1);close(ready[0]);
+        if(n!=1||ok!='Y')recovery();return;}
+    close(ready[0]);
+    if(unshare(CLONE_NEWNS)||mount(NULL,"/",NULL,MS_REC|MS_PRIVATE,NULL))recovery();
+    int dir=open("/h6cache/harmonyos6",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    int out=openat(dir,"full-a25-kmsg.txt",O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0600);
+    int in=open("/dev/kmsg",O_RDONLY|O_NONBLOCK|O_CLOEXEC);
+    int procfd=open("/proc",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if(dir<0||out<0||in<0||procfd<0)recovery();
+    write(ready[1],"Y",1);close(ready[1]);
+    struct timespec t0,t;clock_gettime(CLOCK_MONOTONIC,&t0);
+    int next=20,hilog_started=0;size_t total=0;char b[8192];
+    for(;;){
+        clock_gettime(CLOCK_MONOTONIC,&t);int sec=t.tv_sec-t0.tv_sec;
+        if(sec>=10 && !hilog_started){
+            char path[80];
+            snprintf(path,sizeof(path),"1/root/system/bin/hilog");
+            int check=openat(procfd,path,O_RDONLY|O_CLOEXEC);
+            if(check>=0){
+                close(check);hilog_started=1;
+                char *args[]={"/system/bin/sh","-c",
+                    "while ! hilog -b W; do sleep 1; done; hilog -b I -D d001b00,d004300,d004301,d002f19,d002590; hilog -Q pidoff; hilog -Q domainoff; exec hilog",NULL};
+                capture_command(dir,procfd,"full-a25-hilog.txt",args,290);
+            }
+        }
+        if(sec>=next){
+            snapshot(dir,procfd,sec);
+            if(next==20){
+                char *args[]={"/system/bin/sh","-c",
+                    "hilog -b W; hilog -b I -D d001b00,d004300,d004301,d002f19,d002590; hilog -b W -D d0057c1,d0057c2,d0057c3,d0057c5,d0057c6; "
+                    "hilog -b W -D d001719,d005a01",NULL};
+                capture_command(dir,procfd,"full-a25-logconfig.txt",args,15);
+            }
+            if(next==50){
+                char *gpu[]={"/vendor/bin/h6-egl-dmabuf-probe",NULL};
+                capture_command(dir,procfd,"full-a25-dmabuf-probe.txt",gpu,20);
+                char *args[]={"/system/bin/sh","-c","hilog -b I -t BMS",NULL};
+                capture_command(dir,procfd,"full-a25-logquiet.txt",args,10);
+            }
+            if(next==80 || next==200 || next==290){
+                char filename[80];
+                snprintf(filename,sizeof(filename),"full-a25-wlan-%d.txt",next);
+                char *wifi[]={"/system/bin/sh","/vendor/bin/h6-wlan-diagnostics.sh",NULL};
+                capture_command(dir,procfd,filename,wifi,20);
+            }
+            if(next==140 || next==260){
+                char *args[]={"/system/bin/cat","/data/h6-diagnostics/native-a25.txt",NULL};
+                capture_command(dir,procfd,"full-a25-native.txt",args,10);
+            }
+            if(next==290){
+                char *args[]={"/system/bin/param","get",NULL};
+                capture_command(dir,procfd,"full-a25-params-final.txt",args,10);
+            }
+            if(next==110 || next==230){
+                char *args[]={"/vendor/bin/h6-drm-scanout",NULL};
+                char filename[80];
+                snprintf(filename,sizeof(filename),"full-a25-scanout-%d.ppm",next);
+                capture_command(dir,procfd,filename,args,20);
+            }
+            if(next==110){
+                char *storage[]={"/system/bin/sh","-c",
+                    "cat /proc/mounts; find /data/app/el1/100 /data/app/el2/100 -iname '*settings*' -o -name '*.db'; "
+                    "ls -l /data/service/el1/public/account /data/service/el2/100; "
+                    "param get const.distributed_file_property.enabled",NULL};
+                capture_command(dir,procfd,"full-a25-storage.txt",storage,15);
+            }
+            if(next==80){
+                char *args[]={"/system/bin/param","get",NULL};
+                capture_command(dir,procfd,"full-a25-params.txt",args,15);
+                char *inspect[]={"/system/bin/sh","-c",
+                    "for p in /proc/[0-9]*; do n=$(cat $p/comm 2>/dev/null); "
+                    "case $n in composer_host|render_service|foundation|huks_service|allocator_host|user_auth_host|accountmgr|installd) "
+                    "echo ===$p:$n; cat $p/status $p/maps; ls -l $p/fd; "
+                    "for t in $p/task/*; do echo --$t; cat $t/comm $t/wchan $t/stack; done;; esac; done",NULL};
+                capture_command(dir,procfd,"full-a25-stacks.txt",inspect,15);
+                char *dump[]={"/system/bin/hidumper","-ls",NULL};
+                capture_command(dir,procfd,"full-a25-sa.txt",dump,15);
+            }
+            next+=30;fsync(out);
+        }
+        if(sec>=300){
+            snapshot(dir,procfd,sec);
+            logmsg("full-a25 300-second capture complete; %s",H6_KEEP_RUNNING?"keep system running":"recovery");
+            fsync(out);unlinkat(dir,"full-a25-inflight",0);
+            if(H6_KEEP_RUNNING)_exit(0);
+            recovery();
+        }
+        struct pollfd fd={in,POLLIN,0};poll(&fd,1,250);
+        ssize_t n=read(in,b,sizeof(b));
+        if(n>0 && total<64*1024*1024){write(out,b,n);total+=n;}
+    }
+}
+static void setup_loop(int number,const char *file,int writable)
+{
+    char path[256],buf[80],node[80];unsigned major_num,minor_num;
+    snprintf(path,sizeof(path),"/sys/class/block/loop%d/dev",number);
+    if(readtext(path,buf,sizeof(buf))<0||sscanf(buf,"%u:%u",&major_num,&minor_num)!=2){
+        logmsg("no loop%d sysfs device",number);recovery();
+    }
+    snprintf(node,sizeof(node),"/dev/loop%d",number);
+    mknod(node,S_IFBLK|0600,makedev(major_num,minor_num));
+    snprintf(path,sizeof(path),"/hostdata/harmonyos6/%s",file);
+    int backing=open(path,(writable?O_RDWR:O_RDONLY)|O_CLOEXEC);
+    int loop=open(node,(writable?O_RDWR:O_RDONLY)|O_CLOEXEC);
+    if(backing<0||loop<0||ioctl(loop,LOOP_SET_FD,backing)){
+        logmsg("attach loop%d %s failed: %s",number,path,strerror(errno));recovery();
+    }
+    struct loop_info64 info={0};info.lo_flags=writable?0:LO_FLAGS_READ_ONLY;
+    snprintf((char *)info.lo_file_name,LO_NAME_SIZE,"h6/%s",file);
+    if(ioctl(loop,LOOP_SET_STATUS64,&info)){logmsg("loop flags failed");recovery();}
+    close(loop);close(backing);logmsg("loop%d -> %s (%s)",number,file,writable?"rw":"ro");
+}
+static void refresh_generated_icon_cache(void)
+{
+    if(!H6_REFRESH_ICONS)return;
+    /* Only the isolated test data is mounted here. Preserve all generated
+     * resource DB/WAL/replica files together; never touch the install DB.
+     * BMS repopulates missing resource entries from installed signed HAPs. */
+    char marker[80];
+    const char expected[]="H6-Y2Q-FRESH-TEST-DATA-NO-CREDENTIALS\n";
+    if(readtext("/h6data/h6-diagnostics/empty-credentials-test-only",marker,sizeof(marker)) != sizeof(expected)-1 ||
+       strcmp(marker,expected)) { logmsg("icon refresh: wrong test marker");recovery(); }
+    const char *src="/h6data/service/el1/public/bms/bundle_resources";
+    const char *dst="/h6data/h6-diagnostics/bundle-resources-before-a21";
+    struct stat st,cur;
+    if(lstat(dst,&st)==0) {
+        if(!S_ISDIR(st.st_mode))recovery();
+        if(lstat(src,&cur)==0) {
+            if(!S_ISDIR(cur.st_mode))recovery();
+            logmsg("icon refresh: backup already exists; preserve regenerated cache");return;
+        }
+        if(errno!=ENOENT)recovery();
+    } else {
+        if(errno!=ENOENT || lstat(src,&st) || !S_ISDIR(st.st_mode))recovery();
+        if(rename(src,dst)) { logmsg("icon cache archive failed: %s",strerror(errno));recovery(); }
+        sync();
+    }
+    if(mkdir(src,0700) || chown(src,st.st_uid,st.st_gid) || chmod(src,st.st_mode&07777))recovery();
+    char label[512];ssize_t size=getxattr(dst,"security.selinux",label,sizeof(label));
+    if(size>0 && setxattr(src,"security.selinux",label,size,0))recovery();
+    if(size<0 && errno!=ENODATA && errno!=ENOTSUP)recovery();
+    sync();logmsg("icon refresh: archived generated resource cache; original assets retained");
+}
+
+static void prepare_local_desktop(void)
+{
+    if(!H6_LOCAL_DESKTOP)return;
+    mkdir("/h6data",0700);
+    if(mount("/dev/loop5","/h6data","ext4",MS_NOSUID|MS_NODEV,NULL)) {
+        logmsg("mount isolated test data for local UI setup: %s",strerror(errno));recovery();
+    }
+    pid_t child=fork();if(child<0)recovery();
+    if(child==0) {
+        alarm(20);
+        int out=open("/h6cache/harmonyos6/full-a25-local-desktop.txt",O_WRONLY|O_CREAT|O_TRUNC,0600);
+        if(out<0)_exit(120);
+        dup2(out,1);dup2(out,2);
+        if(out>2)close(out);
+        execl("/h6-local-desktop","h6-local-desktop","/h6data",
+              "/h6data/app/el1/0/database/com.ohos.settingsdata/entry/rdb/settingsdata.db",NULL);
+        _exit(121);
+    }
+    int status=0;waitpid(child,&status,0);
+    if(!WIFEXITED(status)||WEXITSTATUS(status)) {
+        logmsg("local UI setup failed status=%d; recovery",status);recovery();
+    }
+    refresh_generated_icon_cache();
+    if(umount("/h6data")) { logmsg("unmount local data: %s",strerror(errno));recovery(); }
+    logmsg("local UI initialization complete; Huawei activation unchanged");
+}
+static void protect_partitions(void)
+{
+    DIR *d=opendir("/sys/class/block");struct dirent *e;if(!d)return;
+    while((e=readdir(d))){
+        if(strncmp(e->d_name,"sd",2)||!strcmp(e->d_name,"sda32")||!strcmp(e->d_name,"sda37"))continue;
+        char sys[160],b[2048],node[100];
+        snprintf(sys,sizeof(sys),"/sys/class/block/%.50s/uevent",e->d_name);
+        if(readtext(sys,b,sizeof(b))<0||!strstr(b,"PARTNAME="))continue;
+        snprintf(node,sizeof(node),"/dev/%.50s",e->d_name);
+        int fd=open(node,O_RDONLY|O_CLOEXEC),one=1;
+        if(fd>=0){if(ioctl(fd,BLKROSET,&one))logmsg("protect %s: %s",node,strerror(errno));close(fd);}
+    }closedir(d);
+}
+static void test_dma_buf_name(void)
+{
+    int fd=open("/dev/dri/card0",O_RDWR|O_CLOEXEC);
+    struct drm_mode_create_dumb c={.width=64,.height=64,.bpp=32};
+    if(fd<0||ioctl(fd,DRM_IOCTL_MODE_CREATE_DUMB,&c)){
+        logmsg("dma-buf rename probe: create failed %s",strerror(errno));recovery();
+    }
+    struct drm_prime_handle p={.handle=c.handle,.flags=DRM_CLOEXEC|DRM_RDWR,.fd=-1};
+    if(ioctl(fd,DRM_IOCTL_PRIME_HANDLE_TO_FD,&p)){
+        logmsg("dma-buf rename probe: export failed %s",strerror(errno));recovery();
+    }
+    logmsg("dma-buf rename probe: before ioctl");
+    int a=ioctl(p.fd,_IOW('b',1,uint64_t),"h6-y2q-first");
+    int b=ioctl(p.fd,_IOW('b',1,uint64_t),"h6-y2q-second");
+    logmsg("dma-buf rename probe: first=%d second=%d",a,b);
+    close(p.fd);
+    struct drm_mode_destroy_dumb destroy={.handle=c.handle};
+    ioctl(fd,DRM_IOCTL_MODE_DESTROY_DUMB,&destroy);
+    if(a||b)recovery();
+    const uid_t uids[]={3036,3041,1003,20000};
+    for(unsigned i=0;i<sizeof(uids)/sizeof(uids[0]);i++){
+        pid_t p=fork();if(p<0)recovery();
+        if(p==0){
+            if(setgid(uids[i])||setuid(uids[i]))_exit(20);
+            errno=0;int set=ioctl(fd,DRM_IOCTL_SET_MASTER,0),se=errno;
+            errno=0;int drop=ioctl(fd,DRM_IOCTL_DROP_MASTER,0),de=errno;
+            logmsg("DRM master uid=%u set=%d errno=%d drop=%d errno=%d",uids[i],set,se,drop,de);
+            if(uids[i]==20000)_exit(set<0&&se==EACCES&&drop<0&&de==EACCES?0:21);
+            _exit(set==0&&drop==0?0:22);
+        }
+        int status=0;waitpid(p,&status,0);
+        if(!WIFEXITED(status)||WEXITSTATUS(status))recovery();
+    }
+    close(fd);
+}
+int main(void)
+{
+    if(getpid()!=1)return 2;
+    mkdir("/proc",0755);mkdir("/sys",0755);mkdir("/dev",0755);
+    mount("proc","/proc","proc",0,NULL);mount("sysfs","/sys","sysfs",0,NULL);
+    mount("devtmpfs","/dev","devtmpfs",0,"mode=0755");
+    kfd=open("/dev/kmsg",O_WRONLY|O_CLOEXEC);
+    struct utsname u;if(!uname(&u))logmsg("full-a25 kernel %s",u.release);
+    for(int i=0;i<30&&!partition_is("sda37","userdata");i++)sleep(1);
+    if(!partition_is("sda37","userdata")||!partition_is("sda32","cache"))recovery();
+    mkdir("/h6cache",0700);mkdir("/hostdata",0700);
+    if(mount("/dev/sda32","/h6cache","ext4",MS_NOSUID|MS_NODEV,NULL))recovery();
+    setenv("IR3_SHADER_DEBUG","nofp16,nocache",1);
+    setenv("MESA_SHADER_CACHE_DISABLE","true",1);
+    setenv("FD_MESA_DEBUG","flush,inorder",1);
+    start_logger();
+    int binder=open("/dev/binder",O_RDWR|O_CLOEXEC);uint64_t features=0;
+    int br=binder<0?-1:ioctl(binder,_IOWR('b',30,uint64_t),&features);
+    logmsg("binder fd=%d feature ioctl=%d flags=0x%llx",binder,br,(unsigned long long)features);
+    if(binder>=0)close(binder);if(br<0)recovery();
+    test_dma_buf_name();
+    if(mount("/dev/sda37","/hostdata","f2fs",MS_NOSUID|MS_NODEV,NULL)){
+        logmsg("host data mount: %s",strerror(errno));recovery();
+    }
+    setup_loop(0,"donor/system.img",0);setup_loop(1,"vendor-a25.img",0);
+    setup_loop(2,"donor/chip_prod.img",0);setup_loop(3,"donor/sys_prod.img",0);
+    setup_loop(4,"donor/cust.img",0);setup_loop(5,"data-a16.img",1);
+    setup_loop(6,"metadata-a16.img",1);
+    prepare_local_desktop();
+    protect_partitions();
+    FILE *f=fopen("/etc/fstab.required","w");if(!f)recovery();
+    fputs("/dev/block/loop6 /metadata ext4 rw,nosuid,nodev wait,required\n"
+          "/dev/block/loop0 /usr erofs ro wait,required\n"
+          "/dev/block/loop1 /vendor erofs ro wait,required\n"
+          "/dev/block/loop2 /chip_prod erofs ro wait,required\n"
+          "/dev/block/loop3 /sys_prod erofs ro wait,required\n"
+          "/dev/block/loop4 /cust erofs ro wait,required\n"
+          "/dev/block/sda32 /log ext4 rw,nosuid,nodev wait,required\n",f);
+    fclose(f);
+    /* This H6 init_early embeds /system/etc/fstab.required; retain the old
+     * location too for the subsequent startup code. Both live in ramdisk. */
+    mkdir("/system",0755);mkdir("/system/etc",0755);
+    if(link("/etc/fstab.required","/system/etc/fstab.required")){
+        logmsg("H6 fstab link failed: %s",strerror(errno));recovery();
+    }
+    logmsg("handing PID 1 to donor init_early");
+    umount2("/hostdata",MNT_DETACH);umount2("/h6cache",MNT_DETACH);
+    umount2("/dev",MNT_DETACH);umount2("/sys",MNT_DETACH);umount2("/proc",MNT_DETACH);
+    char *args[]={"/init",NULL};execv("/bin/init_early",args);
+    logmsg("init_early exec failed: %s",strerror(errno));recovery();
+}

@@ -1,0 +1,53 @@
+diff -ruN a/fs/proc/Makefile b/fs/proc/Makefile
+--- a/fs/proc/Makefile	2026-10-30 14:55:22
++++ b/fs/proc/Makefile	2026-10-30 14:55:36
+@@ -36,3 +36,4 @@
+ proc-$(CONFIG_PRINTK)	+= kmsg.o
+ proc-$(CONFIG_PROC_PAGE_MONITOR)	+= page.o
+ proc-$(CONFIG_PROC_AVC) += proc_avc.o
++proc-y	+= h6_dsmm.o
+diff -ruN a/fs/proc/h6_dsmm.c b/fs/proc/h6_dsmm.c
+--- a/fs/proc/h6_dsmm.c	1970-01-01 08:00:00
++++ b/fs/proc/h6_dsmm.c	2026-10-30 14:55:29
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * /proc/dsmm/developer for HarmonyOS 6 on this Samsung device.
++ *
++ * H6 init loads this file as parameter lines before the system .para files.
++ * Huawei's DSMM driver fills it from the developer mode state kept in
++ * oeminfo, which this hardware does not have, so the state cannot be
++ * stored and every boot came up with developer mode unset (off).
++ * Developer mode is on unless h6_developer_mode=0 is on the command line.
++ */
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <linux/string.h>
++
++static bool h6_developer_mode = true;
++
++static int __init h6_developer_mode_setup(char *str)
++{
++	return kstrtobool(str, &h6_developer_mode) == 0;
++}
++__setup("h6_developer_mode=", h6_developer_mode_setup);
++
++static int dsmm_developer_proc_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "const.security.developermode.state=%s\n",
++		   h6_developer_mode ? "true" : "false");
++	return 0;
++}
++
++static int __init proc_dsmm_init(void)
++{
++	struct proc_dir_entry *dir = proc_mkdir("dsmm", NULL);
++
++	if (!dir)
++		return -ENOMEM;
++	proc_create_single("developer", 0444, dir, dsmm_developer_proc_show);
++	return 0;
++}
++fs_initcall(proc_dsmm_init);

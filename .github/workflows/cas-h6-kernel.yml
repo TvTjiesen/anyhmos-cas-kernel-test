@@ -1,0 +1,44 @@
+name: cas-h6-kernel
+
+# Build the cas (Xiaomi Mi 10 Ultra / SM8250) 4.19.325 kernel with the
+# HarmonyOS 6 enablement patches proven on the same SoC (SM-G986N / y2q).
+# This workflow only compiles. It never touches a device.
+
+on:
+  push:
+    branches: [cas-h6]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            python3 gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            device-tree-compiler
+
+      - name: Apply patches and build kernel
+        run: bash ci/build.sh
+
+      - name: Upload kernel artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cas-h6-kernel
+          path: artifacts/
+          if-no-files-found: warn
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cas-h6-build-log
+          path: build.log
+          if-no-files-found: warn

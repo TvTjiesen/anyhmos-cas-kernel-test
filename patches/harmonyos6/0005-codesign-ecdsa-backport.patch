@@ -1,0 +1,2785 @@
+--- a/crypto/ecc.c
++++ b/crypto/ecc.c
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (c) 2013, Kenneth MacKay
+- * All rights reserved.
++ * Copyright (c) 2013, 2014 Kenneth MacKay. All rights reserved.
++ * Copyright (c) 2019 Vitaly Chikunov <vt@altlinux.org>
+  *
+  * Redistribution and use in source and binary forms, with or without
+  * modification, are permitted provided that the following conditions are
+@@ -24,12 +24,15 @@
+  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include <linux/module.h>
+ #include <linux/random.h>
+ #include <linux/slab.h>
+ #include <linux/swab.h>
+ #include <linux/fips.h>
+ #include <crypto/ecdh.h>
+ #include <crypto/rng.h>
++#include <asm/unaligned.h>
++#include <linux/ratelimit.h>
+ 
+ #include "ecc.h"
+ #include "ecc_curve_defs.h"
+@@ -39,7 +42,7 @@
+ 	u64 m_high;
+ } uint128_t;
+ 
+-static inline const struct ecc_curve *ecc_get_curve(unsigned int curve_id)
++const struct ecc_curve *ecc_get_curve(unsigned int curve_id)
+ {
+ 	switch (curve_id) {
+ 	/* In FIPS mode only allow P256 and higher */
+@@ -47,10 +50,13 @@
+ 		return fips_enabled ? NULL : &nist_p192;
+ 	case ECC_CURVE_NIST_P256:
+ 		return &nist_p256;
++	case ECC_CURVE_NIST_P384:
++		return &nist_p384;
+ 	default:
+ 		return NULL;
+ 	}
+ }
++EXPORT_SYMBOL(ecc_get_curve);
+ 
+ static u64 *ecc_alloc_digits_space(unsigned int ndigits)
+ {
+@@ -112,7 +118,7 @@
+ }
+ 
+ /* Returns true if vli == 0, false otherwise. */
+-static bool vli_is_zero(const u64 *vli, unsigned int ndigits)
++bool vli_is_zero(const u64 *vli, unsigned int ndigits)
+ {
+ 	int i;
+ 
+@@ -123,11 +129,17 @@
+ 
+ 	return true;
+ }
++EXPORT_SYMBOL(vli_is_zero);
+ 
+ /* Returns nonzero if bit bit of vli is set. */
+ static u64 vli_test_bit(const u64 *vli, unsigned int bit)
+ {
+ 	return (vli[bit / 64] & ((u64)1 << (bit % 64)));
++}
++
++static bool vli_is_negative(const u64 *vli, unsigned int ndigits)
++{
++	return vli_test_bit(vli, ndigits * 64 - 1);
+ }
+ 
+ /* Counts the number of 64-bit "digits" in vli. */
+@@ -161,6 +173,27 @@
+ 	return ((num_digits - 1) * 64 + i);
+ }
+ 
++/* Set dest from unaligned bit string src. */
++void vli_from_be64(u64 *dest, const void *src, unsigned int ndigits)
++{
++	int i;
++	const u64 *from = src;
++
++	for (i = 0; i < ndigits; i++)
++		dest[i] = get_unaligned_be64(&from[ndigits - 1 - i]);
++}
++EXPORT_SYMBOL(vli_from_be64);
++
++void vli_from_le64(u64 *dest, const void *src, unsigned int ndigits)
++{
++	int i;
++	const u64 *from = src;
++
++	for (i = 0; i < ndigits; i++)
++		dest[i] = get_unaligned_le64(&from[i]);
++}
++EXPORT_SYMBOL(vli_from_le64);
++
+ /* Sets dest = src. */
+ static void vli_set(u64 *dest, const u64 *src, unsigned int ndigits)
+ {
+@@ -171,7 +204,7 @@
+ }
+ 
+ /* Returns sign of left - right. */
+-static int vli_cmp(const u64 *left, const u64 *right, unsigned int ndigits)
++int vli_cmp(const u64 *left, const u64 *right, unsigned int ndigits)
+ {
+ 	int i;
+ 
+@@ -184,6 +217,7 @@
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL(vli_cmp);
+ 
+ /* Computes result = in << c, returning carry. Can modify in place
+  * (if result == in). 0 < shift < 64.
+@@ -239,8 +273,30 @@
+ 	return carry;
+ }
+ 
++/* Computes result = left + right, returning carry. Can modify in place. */
++static u64 vli_uadd(u64 *result, const u64 *left, u64 right,
++		    unsigned int ndigits)
++{
++	u64 carry = right;
++	int i;
++
++	for (i = 0; i < ndigits; i++) {
++		u64 sum;
++
++		sum = left[i] + carry;
++		if (sum != left[i])
++			carry = (sum < left[i]);
++		else
++			carry = !!carry;
++
++		result[i] = sum;
++	}
++
++	return carry;
++}
++
+ /* Computes result = left - right, returning borrow. Can modify in place. */
+-static u64 vli_sub(u64 *result, const u64 *left, const u64 *right,
++u64 vli_sub(u64 *result, const u64 *left, const u64 *right,
+ 		   unsigned int ndigits)
+ {
+ 	u64 borrow = 0;
+@@ -258,9 +314,37 @@
+ 
+ 	return borrow;
+ }
++EXPORT_SYMBOL(vli_sub);
++
++/* Computes result = left - right, returning borrow. Can modify in place. */
++static u64 vli_usub(u64 *result, const u64 *left, u64 right,
++	     unsigned int ndigits)
++{
++	u64 borrow = right;
++	int i;
++
++	for (i = 0; i < ndigits; i++) {
++		u64 diff;
++
++		diff = left[i] - borrow;
++		if (diff != left[i])
++			borrow = (diff > left[i]);
++
++		result[i] = diff;
++	}
++
++	return borrow;
++}
+ 
+ static uint128_t mul_64_64(u64 left, u64 right)
+ {
++	uint128_t result;
++#if defined(CONFIG_ARCH_SUPPORTS_INT128)
++	unsigned __int128 m = (unsigned __int128)left * right;
++
++	result.m_low  = m;
++	result.m_high = m >> 64;
++#else
+ 	u64 a0 = left & 0xffffffffull;
+ 	u64 a1 = left >> 32;
+ 	u64 b0 = right & 0xffffffffull;
+@@ -269,7 +353,6 @@
+ 	u64 m1 = a0 * b1;
+ 	u64 m2 = a1 * b0;
+ 	u64 m3 = a1 * b1;
+-	uint128_t result;
+ 
+ 	m2 += (m0 >> 32);
+ 	m2 += m1;
+@@ -280,30 +363,18 @@
+ 
+ 	result.m_low = (m0 & 0xffffffffull) | (m2 << 32);
+ 	result.m_high = m3 + (m2 >> 32);
+-
++#endif
+ 	return result;
+ }
+ 
+-/* Calculate addition with overflow checking. Returns true on wrap-around,
+- * false otherwise.
+- */
+-static bool check_add_128_128_overflow(uint128_t *result, uint128_t a,
+-				       uint128_t b)
+-{
+-	bool carry;
+-
+-	result->m_low = a.m_low + b.m_low;
+-	carry = (result->m_low < a.m_low);
+-
+-	result->m_high = a.m_high + b.m_high + carry;
+-
+-	/* Using constant-time bitwise arithmetic to prevent timing
+-	 * side-channels.
+-	 */
+-	carry = (result->m_high < a.m_high) |
+-		((result->m_high == a.m_high) & carry);
+-
+-	return carry;
++static uint128_t add_128_128(uint128_t a, uint128_t b)
++{
++	uint128_t result;
++
++	result.m_low = a.m_low + b.m_low;
++	result.m_high = a.m_high + b.m_high + (result.m_low < a.m_low);
++
++	return result;
+ }
+ 
+ static void vli_mult(u64 *result, const u64 *left, const u64 *right,
+@@ -328,7 +399,9 @@
+ 			uint128_t product;
+ 
+ 			product = mul_64_64(left[i], right[k - i]);
+-			r2 += check_add_128_128_overflow(&r01, r01, product);
++
++			r01 = add_128_128(r01, product);
++			r2 += (r01.m_high < product.m_high);
+ 		}
+ 
+ 		result[k] = r01.m_low;
+@@ -338,6 +411,28 @@
+ 	}
+ 
+ 	result[ndigits * 2 - 1] = r01.m_low;
++}
++
++/* Compute product = left * right, for a small right value. */
++static void vli_umult(u64 *result, const u64 *left, u32 right,
++		      unsigned int ndigits)
++{
++	uint128_t r01 = { 0 };
++	unsigned int k;
++
++	for (k = 0; k < ndigits; k++) {
++		uint128_t product;
++
++		product = mul_64_64(left[k], right);
++		r01 = add_128_128(r01, product);
++		/* no carry */
++		result[k] = r01.m_low;
++		r01.m_low = r01.m_high;
++		r01.m_high = 0;
++	}
++	result[k] = r01.m_low;
++	for (++k; k < ndigits * 2; k++)
++		result[k] = 0;
+ }
+ 
+ static void vli_square(u64 *result, const u64 *left, unsigned int ndigits)
+@@ -366,7 +461,8 @@
+ 				product.m_low <<= 1;
+ 			}
+ 
+-			r2 += check_add_128_128_overflow(&r01, r01, product);
++			r01 = add_128_128(r01, product);
++			r2 += (r01.m_high < product.m_high);
+ 		}
+ 
+ 		result[k] = r01.m_low;
+@@ -409,6 +505,170 @@
+ 	 */
+ 	if (borrow)
+ 		vli_add(result, result, mod, ndigits);
++}
++
++/*
++ * Computes result = product % mod
++ * for special form moduli: p = 2^k-c, for small c (note the minus sign)
++ *
++ * References:
++ * R. Crandall, C. Pomerance. Prime Numbers: A Computational Perspective.
++ * 9 Fast Algorithms for Large-Integer Arithmetic. 9.2.3 Moduli of special form
++ * Algorithm 9.2.13 (Fast mod operation for special-form moduli).
++ */
++static void vli_mmod_special(u64 *result, const u64 *product,
++			      const u64 *mod, unsigned int ndigits)
++{
++	u64 c = -mod[0];
++	u64 t[ECC_MAX_DIGITS * 2];
++	u64 r[ECC_MAX_DIGITS * 2];
++
++	vli_set(r, product, ndigits * 2);
++	while (!vli_is_zero(r + ndigits, ndigits)) {
++		vli_umult(t, r + ndigits, c, ndigits);
++		vli_clear(r + ndigits, ndigits);
++		vli_add(r, r, t, ndigits * 2);
++	}
++	vli_set(t, mod, ndigits);
++	vli_clear(t + ndigits, ndigits);
++	while (vli_cmp(r, t, ndigits * 2) >= 0)
++		vli_sub(r, r, t, ndigits * 2);
++	vli_set(result, r, ndigits);
++}
++
++/*
++ * Computes result = product % mod
++ * for special form moduli: p = 2^{k-1}+c, for small c (note the plus sign)
++ * where k-1 does not fit into qword boundary by -1 bit (such as 255).
++
++ * References (loosely based on):
++ * A. Menezes, P. van Oorschot, S. Vanstone. Handbook of Applied Cryptography.
++ * 14.3.4 Reduction methods for moduli of special form. Algorithm 14.47.
++ * URL: http://cacr.uwaterloo.ca/hac/about/chap14.pdf
++ *
++ * H. Cohen, G. Frey, R. Avanzi, C. Doche, T. Lange, K. Nguyen, F. Vercauteren.
++ * Handbook of Elliptic and Hyperelliptic Curve Cryptography.
++ * Algorithm 10.25 Fast reduction for special form moduli
++ */
++static void vli_mmod_special2(u64 *result, const u64 *product,
++			       const u64 *mod, unsigned int ndigits)
++{
++	u64 c2 = mod[0] * 2;
++	u64 q[ECC_MAX_DIGITS];
++	u64 r[ECC_MAX_DIGITS * 2];
++	u64 m[ECC_MAX_DIGITS * 2]; /* expanded mod */
++	int carry; /* last bit that doesn't fit into q */
++	int i;
++
++	vli_set(m, mod, ndigits);
++	vli_clear(m + ndigits, ndigits);
++
++	vli_set(r, product, ndigits);
++	/* q and carry are top bits */
++	vli_set(q, product + ndigits, ndigits);
++	vli_clear(r + ndigits, ndigits);
++	carry = vli_is_negative(r, ndigits);
++	if (carry)
++		r[ndigits - 1] &= (1ull << 63) - 1;
++	for (i = 1; carry || !vli_is_zero(q, ndigits); i++) {
++		u64 qc[ECC_MAX_DIGITS * 2];
++
++		vli_umult(qc, q, c2, ndigits);
++		if (carry)
++			vli_uadd(qc, qc, mod[0], ndigits * 2);
++		vli_set(q, qc + ndigits, ndigits);
++		vli_clear(qc + ndigits, ndigits);
++		carry = vli_is_negative(qc, ndigits);
++		if (carry)
++			qc[ndigits - 1] &= (1ull << 63) - 1;
++		if (i & 1)
++			vli_sub(r, r, qc, ndigits * 2);
++		else
++			vli_add(r, r, qc, ndigits * 2);
++	}
++	while (vli_is_negative(r, ndigits * 2))
++		vli_add(r, r, m, ndigits * 2);
++	while (vli_cmp(r, m, ndigits * 2) >= 0)
++		vli_sub(r, r, m, ndigits * 2);
++
++	vli_set(result, r, ndigits);
++}
++
++/*
++ * Computes result = product % mod, where product is 2N words long.
++ * Reference: Ken MacKay's micro-ecc.
++ * Currently only designed to work for curve_p or curve_n.
++ */
++static void vli_mmod_slow(u64 *result, u64 *product, const u64 *mod,
++			  unsigned int ndigits)
++{
++	u64 mod_m[2 * ECC_MAX_DIGITS];
++	u64 tmp[2 * ECC_MAX_DIGITS];
++	u64 *v[2] = { tmp, product };
++	u64 carry = 0;
++	unsigned int i;
++	/* Shift mod so its highest set bit is at the maximum position. */
++	int shift = (ndigits * 2 * 64) - vli_num_bits(mod, ndigits);
++	int word_shift = shift / 64;
++	int bit_shift = shift % 64;
++
++	vli_clear(mod_m, word_shift);
++	if (bit_shift > 0) {
++		for (i = 0; i < ndigits; ++i) {
++			mod_m[word_shift + i] = (mod[i] << bit_shift) | carry;
++			carry = mod[i] >> (64 - bit_shift);
++		}
++	} else
++		vli_set(mod_m + word_shift, mod, ndigits);
++
++	for (i = 1; shift >= 0; --shift) {
++		u64 borrow = 0;
++		unsigned int j;
++
++		for (j = 0; j < ndigits * 2; ++j) {
++			u64 diff = v[i][j] - mod_m[j] - borrow;
++
++			if (diff != v[i][j])
++				borrow = (diff > v[i][j]);
++			v[1 - i][j] = diff;
++		}
++		i = !(i ^ borrow); /* Swap the index if there was no borrow */
++		vli_rshift1(mod_m, ndigits);
++		mod_m[ndigits - 1] |= mod_m[ndigits] << (64 - 1);
++		vli_rshift1(mod_m + ndigits, ndigits);
++	}
++	vli_set(result, v[i], ndigits);
++}
++
++/* Computes result = product % mod using Barrett's reduction with precomputed
++ * value mu appended to the mod after ndigits, mu = (2^{2w} / mod) and have
++ * length ndigits + 1, where mu * (2^w - 1) should not overflow ndigits
++ * boundary.
++ *
++ * Reference:
++ * R. Brent, P. Zimmermann. Modern Computer Arithmetic. 2010.
++ * 2.4.1 Barrett's algorithm. Algorithm 2.5.
++ */
++static void vli_mmod_barrett(u64 *result, u64 *product, const u64 *mod,
++			     unsigned int ndigits)
++{
++	u64 q[ECC_MAX_DIGITS * 2];
++	u64 r[ECC_MAX_DIGITS * 2];
++	const u64 *mu = mod + ndigits;
++
++	vli_mult(q, product + ndigits, mu, ndigits);
++	if (mu[ndigits])
++		vli_add(q + ndigits, q + ndigits, product + ndigits, ndigits);
++	vli_mult(r, mod, q + ndigits, ndigits);
++	vli_sub(r, product, r, ndigits * 2);
++	while (!vli_is_zero(r + ndigits, ndigits) ||
++	       vli_cmp(r, mod, ndigits) != -1) {
++		u64 carry;
++
++		carry = vli_sub(r, r, mod, ndigits);
++		vli_usub(r + ndigits, r + ndigits, carry, ndigits);
++	}
++	vli_set(result, r, ndigits);
+ }
+ 
+ /* Computes p_result = p_product % curve_p.
+@@ -518,13 +778,147 @@
+ 	}
+ }
+ 
++#define SL32OR32(x32, y32) (((u64)x32 << 32) | y32)
++#define AND64H(x64)  (x64 & 0xffFFffFF00000000ull)
++#define AND64L(x64)  (x64 & 0x00000000ffFFffFFull)
++
+ /* Computes result = product % curve_prime
+- *  from http://www.nsa.gov/ia/_files/nist-routines.pdf
+-*/
++ * from "Mathematical routines for the NIST prime elliptic curves"
++ */
++static void vli_mmod_fast_384(u64 *result, const u64 *product,
++				const u64 *curve_prime, u64 *tmp)
++{
++	int carry;
++	const unsigned int ndigits = 6;
++
++	/* t */
++	vli_set(result, product, ndigits);
++
++	/* s1 */
++	tmp[0] = 0;		// 0 || 0
++	tmp[1] = 0;		// 0 || 0
++	tmp[2] = SL32OR32(product[11], (product[10]>>32));	//a22||a21
++	tmp[3] = product[11]>>32;	// 0 ||a23
++	tmp[4] = 0;		// 0 || 0
++	tmp[5] = 0;		// 0 || 0
++	carry = vli_lshift(tmp, tmp, 1, ndigits);
++	carry += vli_add(result, result, tmp, ndigits);
++
++	/* s2 */
++	tmp[0] = product[6];	//a13||a12
++	tmp[1] = product[7];	//a15||a14
++	tmp[2] = product[8];	//a17||a16
++	tmp[3] = product[9];	//a19||a18
++	tmp[4] = product[10];	//a21||a20
++	tmp[5] = product[11];	//a23||a22
++	carry += vli_add(result, result, tmp, ndigits);
++
++	/* s3 */
++	tmp[0] = SL32OR32(product[11], (product[10]>>32));	//a22||a21
++	tmp[1] = SL32OR32(product[6], (product[11]>>32));	//a12||a23
++	tmp[2] = SL32OR32(product[7], (product[6])>>32);	//a14||a13
++	tmp[3] = SL32OR32(product[8], (product[7]>>32));	//a16||a15
++	tmp[4] = SL32OR32(product[9], (product[8]>>32));	//a18||a17
++	tmp[5] = SL32OR32(product[10], (product[9]>>32));	//a20||a19
++	carry += vli_add(result, result, tmp, ndigits);
++
++	/* s4 */
++	tmp[0] = AND64H(product[11]);	//a23|| 0
++	tmp[1] = (product[10]<<32);	//a20|| 0
++	tmp[2] = product[6];	//a13||a12
++	tmp[3] = product[7];	//a15||a14
++	tmp[4] = product[8];	//a17||a16
++	tmp[5] = product[9];	//a19||a18
++	carry += vli_add(result, result, tmp, ndigits);
++
++	/* s5 */
++	tmp[0] = 0;		//  0|| 0
++	tmp[1] = 0;		//  0|| 0
++	tmp[2] = product[10];	//a21||a20
++	tmp[3] = product[11];	//a23||a22
++	tmp[4] = 0;		//  0|| 0
++	tmp[5] = 0;		//  0|| 0
++	carry += vli_add(result, result, tmp, ndigits);
++
++	/* s6 */
++	tmp[0] = AND64L(product[10]);	// 0 ||a20
++	tmp[1] = AND64H(product[10]);	//a21|| 0
++	tmp[2] = product[11];	//a23||a22
++	tmp[3] = 0;		// 0 || 0
++	tmp[4] = 0;		// 0 || 0
++	tmp[5] = 0;		// 0 || 0
++	carry += vli_add(result, result, tmp, ndigits);
++
++	/* d1 */
++	tmp[0] = SL32OR32(product[6], (product[11]>>32));	//a12||a23
++	tmp[1] = SL32OR32(product[7], (product[6]>>32));	//a14||a13
++	tmp[2] = SL32OR32(product[8], (product[7]>>32));	//a16||a15
++	tmp[3] = SL32OR32(product[9], (product[8]>>32));	//a18||a17
++	tmp[4] = SL32OR32(product[10], (product[9]>>32));	//a20||a19
++	tmp[5] = SL32OR32(product[11], (product[10]>>32));	//a22||a21
++	carry -= vli_sub(result, result, tmp, ndigits);
++
++	/* d2 */
++	tmp[0] = (product[10]<<32);	//a20|| 0
++	tmp[1] = SL32OR32(product[11], (product[10]>>32));	//a22||a21
++	tmp[2] = (product[11]>>32);	// 0 ||a23
++	tmp[3] = 0;		// 0 || 0
++	tmp[4] = 0;		// 0 || 0
++	tmp[5] = 0;		// 0 || 0
++	carry -= vli_sub(result, result, tmp, ndigits);
++
++	/* d3 */
++	tmp[0] = 0;		// 0 || 0
++	tmp[1] = AND64H(product[11]);	//a23|| 0
++	tmp[2] = product[11]>>32;	// 0 ||a23
++	tmp[3] = 0;		// 0 || 0
++	tmp[4] = 0;		// 0 || 0
++	tmp[5] = 0;		// 0 || 0
++	carry -= vli_sub(result, result, tmp, ndigits);
++
++	if (carry < 0) {
++		do {
++			carry += vli_add(result, result, curve_prime, ndigits);
++		} while (carry < 0);
++	} else {
++		while (carry || vli_cmp(curve_prime, result, ndigits) != 1)
++			carry -= vli_sub(result, result, curve_prime, ndigits);
++	}
++
++}
++
++#undef SL32OR32
++#undef AND64H
++#undef AND64L
++
++/* Computes result = product % curve_prime for different curve_primes.
++ *
++ * Note that curve_primes are distinguished just by heuristic check and
++ * not by complete conformance check.
++ */
+ static bool vli_mmod_fast(u64 *result, u64 *product,
+-			  const u64 *curve_prime, unsigned int ndigits)
++			  const struct ecc_curve *curve)
+ {
+ 	u64 tmp[2 * ECC_MAX_DIGITS];
++	const u64 *curve_prime = curve->p;
++	const unsigned int ndigits = curve->g.ndigits;
++
++	/* All NIST curves have name prefix 'nist_' */
++	if (strncmp(curve->name, "nist_", 5) != 0) {
++		/* Try to handle Pseudo-Marsenne primes. */
++		if (curve_prime[ndigits - 1] == -1ull) {
++			vli_mmod_special(result, product, curve_prime,
++					 ndigits);
++			return true;
++		} else if (curve_prime[ndigits - 1] == 1ull << 63 &&
++			   curve_prime[ndigits - 2] == 0) {
++			vli_mmod_special2(result, product, curve_prime,
++					  ndigits);
++			return true;
++		}
++		vli_mmod_barrett(result, product, curve_prime, ndigits);
++		return true;
++	}
+ 
+ 	switch (ndigits) {
+ 	case 3:
+@@ -533,32 +927,48 @@
+ 	case 4:
+ 		vli_mmod_fast_256(result, product, curve_prime, tmp);
+ 		break;
++	case 6:
++		vli_mmod_fast_384(result, product, curve_prime, tmp);
++		break;
+ 	default:
+-		pr_err("unsupports digits size!\n");
++		pr_err_ratelimited("ecc: unsupported digits size!\n");
+ 		return false;
+ 	}
+ 
+ 	return true;
+ }
++
++/* Computes result = (left * right) % mod.
++ * Assumes that mod is big enough curve order.
++ */
++void vli_mod_mult_slow(u64 *result, const u64 *left, const u64 *right,
++		       const u64 *mod, unsigned int ndigits)
++{
++	u64 product[ECC_MAX_DIGITS * 2];
++
++	vli_mult(product, left, right, ndigits);
++	vli_mmod_slow(result, product, mod, ndigits);
++}
++EXPORT_SYMBOL(vli_mod_mult_slow);
+ 
+ /* Computes result = (left * right) % curve_prime. */
+ static void vli_mod_mult_fast(u64 *result, const u64 *left, const u64 *right,
+-			      const u64 *curve_prime, unsigned int ndigits)
++			      const struct ecc_curve *curve)
+ {
+ 	u64 product[2 * ECC_MAX_DIGITS];
+ 
+-	vli_mult(product, left, right, ndigits);
+-	vli_mmod_fast(result, product, curve_prime, ndigits);
++	vli_mult(product, left, right, curve->g.ndigits);
++	vli_mmod_fast(result, product, curve);
+ }
+ 
+ /* Computes result = left^2 % curve_prime. */
+ static void vli_mod_square_fast(u64 *result, const u64 *left,
+-				const u64 *curve_prime, unsigned int ndigits)
++				const struct ecc_curve *curve)
+ {
+ 	u64 product[2 * ECC_MAX_DIGITS];
+ 
+-	vli_square(product, left, ndigits);
+-	vli_mmod_fast(result, product, curve_prime, ndigits);
++	vli_square(product, left, curve->g.ndigits);
++	vli_mmod_fast(result, product, curve);
+ }
+ 
+ #define EVEN(vli) (!(vli[0] & 1))
+@@ -566,7 +976,7 @@
+  * See "From Euclid's GCD to Montgomery Multiplication to the Great Divide"
+  * https://labs.oracle.com/techrep/2001/smli_tr-2001-95.pdf
+  */
+-static void vli_mod_inv(u64 *result, const u64 *input, const u64 *mod,
++void vli_mod_inv(u64 *result, const u64 *input, const u64 *mod,
+ 			unsigned int ndigits)
+ {
+ 	u64 a[ECC_MAX_DIGITS], b[ECC_MAX_DIGITS];
+@@ -639,6 +1049,7 @@
+ 
+ 	vli_set(result, u, ndigits);
+ }
++EXPORT_SYMBOL(vli_mod_inv);
+ 
+ /* ------ Point operations ------ */
+ 
+@@ -650,30 +1061,32 @@
+ }
+ 
+ /* Point multiplication algorithm using Montgomery's ladder with co-Z
+- * coordinates. From http://eprint.iacr.org/2011/338.pdf
++ * coordinates. From https://eprint.iacr.org/2011/338.pdf
+  */
+ 
+ /* Double in place */
+ static void ecc_point_double_jacobian(u64 *x1, u64 *y1, u64 *z1,
+-				      u64 *curve_prime, unsigned int ndigits)
++					const struct ecc_curve *curve)
+ {
+ 	/* t1 = x, t2 = y, t3 = z */
+ 	u64 t4[ECC_MAX_DIGITS];
+ 	u64 t5[ECC_MAX_DIGITS];
++	const u64 *curve_prime = curve->p;
++	const unsigned int ndigits = curve->g.ndigits;
+ 
+ 	if (vli_is_zero(z1, ndigits))
+ 		return;
+ 
+ 	/* t4 = y1^2 */
+-	vli_mod_square_fast(t4, y1, curve_prime, ndigits);
++	vli_mod_square_fast(t4, y1, curve);
+ 	/* t5 = x1*y1^2 = A */
+-	vli_mod_mult_fast(t5, x1, t4, curve_prime, ndigits);
++	vli_mod_mult_fast(t5, x1, t4, curve);
+ 	/* t4 = y1^4 */
+-	vli_mod_square_fast(t4, t4, curve_prime, ndigits);
++	vli_mod_square_fast(t4, t4, curve);
+ 	/* t2 = y1*z1 = z3 */
+-	vli_mod_mult_fast(y1, y1, z1, curve_prime, ndigits);
++	vli_mod_mult_fast(y1, y1, z1, curve);
+ 	/* t3 = z1^2 */
+-	vli_mod_square_fast(z1, z1, curve_prime, ndigits);
++	vli_mod_square_fast(z1, z1, curve);
+ 
+ 	/* t1 = x1 + z1^2 */
+ 	vli_mod_add(x1, x1, z1, curve_prime, ndigits);
+@@ -682,7 +1095,7 @@
+ 	/* t3 = x1 - z1^2 */
+ 	vli_mod_sub(z1, x1, z1, curve_prime, ndigits);
+ 	/* t1 = x1^2 - z1^4 */
+-	vli_mod_mult_fast(x1, x1, z1, curve_prime, ndigits);
++	vli_mod_mult_fast(x1, x1, z1, curve);
+ 
+ 	/* t3 = 2*(x1^2 - z1^4) */
+ 	vli_mod_add(z1, x1, x1, curve_prime, ndigits);
+@@ -699,7 +1112,7 @@
+ 	/* t1 = 3/2*(x1^2 - z1^4) = B */
+ 
+ 	/* t3 = B^2 */
+-	vli_mod_square_fast(z1, x1, curve_prime, ndigits);
++	vli_mod_square_fast(z1, x1, curve);
+ 	/* t3 = B^2 - A */
+ 	vli_mod_sub(z1, z1, t5, curve_prime, ndigits);
+ 	/* t3 = B^2 - 2A = x3 */
+@@ -707,7 +1120,7 @@
+ 	/* t5 = A - x3 */
+ 	vli_mod_sub(t5, t5, z1, curve_prime, ndigits);
+ 	/* t1 = B * (A - x3) */
+-	vli_mod_mult_fast(x1, x1, t5, curve_prime, ndigits);
++	vli_mod_mult_fast(x1, x1, t5, curve);
+ 	/* t4 = B * (A - x3) - y1^4 = y3 */
+ 	vli_mod_sub(t4, x1, t4, curve_prime, ndigits);
+ 
+@@ -717,23 +1130,22 @@
+ }
+ 
+ /* Modify (x1, y1) => (x1 * z^2, y1 * z^3) */
+-static void apply_z(u64 *x1, u64 *y1, u64 *z, u64 *curve_prime,
+-		    unsigned int ndigits)
++static void apply_z(u64 *x1, u64 *y1, u64 *z, const struct ecc_curve *curve)
+ {
+ 	u64 t1[ECC_MAX_DIGITS];
+ 
+-	vli_mod_square_fast(t1, z, curve_prime, ndigits);    /* z^2 */
+-	vli_mod_mult_fast(x1, x1, t1, curve_prime, ndigits); /* x1 * z^2 */
+-	vli_mod_mult_fast(t1, t1, z, curve_prime, ndigits);  /* z^3 */
+-	vli_mod_mult_fast(y1, y1, t1, curve_prime, ndigits); /* y1 * z^3 */
++	vli_mod_square_fast(t1, z, curve);		/* z^2 */
++	vli_mod_mult_fast(x1, x1, t1, curve);	/* x1 * z^2 */
++	vli_mod_mult_fast(t1, t1, z, curve);	/* z^3 */
++	vli_mod_mult_fast(y1, y1, t1, curve);	/* y1 * z^3 */
+ }
+ 
+ /* P = (x1, y1) => 2P, (x2, y2) => P' */
+ static void xycz_initial_double(u64 *x1, u64 *y1, u64 *x2, u64 *y2,
+-				u64 *p_initial_z, u64 *curve_prime,
+-				unsigned int ndigits)
++				u64 *p_initial_z, const struct ecc_curve *curve)
+ {
+ 	u64 z[ECC_MAX_DIGITS];
++	const unsigned int ndigits = curve->g.ndigits;
+ 
+ 	vli_set(x2, x1, ndigits);
+ 	vli_set(y2, y1, ndigits);
+@@ -744,35 +1156,37 @@
+ 	if (p_initial_z)
+ 		vli_set(z, p_initial_z, ndigits);
+ 
+-	apply_z(x1, y1, z, curve_prime, ndigits);
+-
+-	ecc_point_double_jacobian(x1, y1, z, curve_prime, ndigits);
+-
+-	apply_z(x2, y2, z, curve_prime, ndigits);
++	apply_z(x1, y1, z, curve);
++
++	ecc_point_double_jacobian(x1, y1, z, curve);
++
++	apply_z(x2, y2, z, curve);
+ }
+ 
+ /* Input P = (x1, y1, Z), Q = (x2, y2, Z)
+  * Output P' = (x1', y1', Z3), P + Q = (x3, y3, Z3)
+  * or P => P', Q => P + Q
+  */
+-static void xycz_add(u64 *x1, u64 *y1, u64 *x2, u64 *y2, u64 *curve_prime,
+-		     unsigned int ndigits)
++static void xycz_add(u64 *x1, u64 *y1, u64 *x2, u64 *y2,
++			const struct ecc_curve *curve)
+ {
+ 	/* t1 = X1, t2 = Y1, t3 = X2, t4 = Y2 */
+ 	u64 t5[ECC_MAX_DIGITS];
++	const u64 *curve_prime = curve->p;
++	const unsigned int ndigits = curve->g.ndigits;
+ 
+ 	/* t5 = x2 - x1 */
+ 	vli_mod_sub(t5, x2, x1, curve_prime, ndigits);
+ 	/* t5 = (x2 - x1)^2 = A */
+-	vli_mod_square_fast(t5, t5, curve_prime, ndigits);
++	vli_mod_square_fast(t5, t5, curve);
+ 	/* t1 = x1*A = B */
+-	vli_mod_mult_fast(x1, x1, t5, curve_prime, ndigits);
++	vli_mod_mult_fast(x1, x1, t5, curve);
+ 	/* t3 = x2*A = C */
+-	vli_mod_mult_fast(x2, x2, t5, curve_prime, ndigits);
++	vli_mod_mult_fast(x2, x2, t5, curve);
+ 	/* t4 = y2 - y1 */
+ 	vli_mod_sub(y2, y2, y1, curve_prime, ndigits);
+ 	/* t5 = (y2 - y1)^2 = D */
+-	vli_mod_square_fast(t5, y2, curve_prime, ndigits);
++	vli_mod_square_fast(t5, y2, curve);
+ 
+ 	/* t5 = D - B */
+ 	vli_mod_sub(t5, t5, x1, curve_prime, ndigits);
+@@ -781,11 +1195,11 @@
+ 	/* t3 = C - B */
+ 	vli_mod_sub(x2, x2, x1, curve_prime, ndigits);
+ 	/* t2 = y1*(C - B) */
+-	vli_mod_mult_fast(y1, y1, x2, curve_prime, ndigits);
++	vli_mod_mult_fast(y1, y1, x2, curve);
+ 	/* t3 = B - x3 */
+ 	vli_mod_sub(x2, x1, t5, curve_prime, ndigits);
+ 	/* t4 = (y2 - y1)*(B - x3) */
+-	vli_mod_mult_fast(y2, y2, x2, curve_prime, ndigits);
++	vli_mod_mult_fast(y2, y2, x2, curve);
+ 	/* t4 = y3 */
+ 	vli_mod_sub(y2, y2, y1, curve_prime, ndigits);
+ 
+@@ -796,22 +1210,24 @@
+  * Output P + Q = (x3, y3, Z3), P - Q = (x3', y3', Z3)
+  * or P => P - Q, Q => P + Q
+  */
+-static void xycz_add_c(u64 *x1, u64 *y1, u64 *x2, u64 *y2, u64 *curve_prime,
+-		       unsigned int ndigits)
++static void xycz_add_c(u64 *x1, u64 *y1, u64 *x2, u64 *y2,
++			const struct ecc_curve *curve)
+ {
+ 	/* t1 = X1, t2 = Y1, t3 = X2, t4 = Y2 */
+ 	u64 t5[ECC_MAX_DIGITS];
+ 	u64 t6[ECC_MAX_DIGITS];
+ 	u64 t7[ECC_MAX_DIGITS];
++	const u64 *curve_prime = curve->p;
++	const unsigned int ndigits = curve->g.ndigits;
+ 
+ 	/* t5 = x2 - x1 */
+ 	vli_mod_sub(t5, x2, x1, curve_prime, ndigits);
+ 	/* t5 = (x2 - x1)^2 = A */
+-	vli_mod_square_fast(t5, t5, curve_prime, ndigits);
++	vli_mod_square_fast(t5, t5, curve);
+ 	/* t1 = x1*A = B */
+-	vli_mod_mult_fast(x1, x1, t5, curve_prime, ndigits);
++	vli_mod_mult_fast(x1, x1, t5, curve);
+ 	/* t3 = x2*A = C */
+-	vli_mod_mult_fast(x2, x2, t5, curve_prime, ndigits);
++	vli_mod_mult_fast(x2, x2, t5, curve);
+ 	/* t4 = y2 + y1 */
+ 	vli_mod_add(t5, y2, y1, curve_prime, ndigits);
+ 	/* t4 = y2 - y1 */
+@@ -820,29 +1236,29 @@
+ 	/* t6 = C - B */
+ 	vli_mod_sub(t6, x2, x1, curve_prime, ndigits);
+ 	/* t2 = y1 * (C - B) */
+-	vli_mod_mult_fast(y1, y1, t6, curve_prime, ndigits);
++	vli_mod_mult_fast(y1, y1, t6, curve);
+ 	/* t6 = B + C */
+ 	vli_mod_add(t6, x1, x2, curve_prime, ndigits);
+ 	/* t3 = (y2 - y1)^2 */
+-	vli_mod_square_fast(x2, y2, curve_prime, ndigits);
++	vli_mod_square_fast(x2, y2, curve);
+ 	/* t3 = x3 */
+ 	vli_mod_sub(x2, x2, t6, curve_prime, ndigits);
+ 
+ 	/* t7 = B - x3 */
+ 	vli_mod_sub(t7, x1, x2, curve_prime, ndigits);
+ 	/* t4 = (y2 - y1)*(B - x3) */
+-	vli_mod_mult_fast(y2, y2, t7, curve_prime, ndigits);
++	vli_mod_mult_fast(y2, y2, t7, curve);
+ 	/* t4 = y3 */
+ 	vli_mod_sub(y2, y2, y1, curve_prime, ndigits);
+ 
+ 	/* t7 = (y2 + y1)^2 = F */
+-	vli_mod_square_fast(t7, t5, curve_prime, ndigits);
++	vli_mod_square_fast(t7, t5, curve);
+ 	/* t7 = x3' */
+ 	vli_mod_sub(t7, t7, t6, curve_prime, ndigits);
+ 	/* t6 = x3' - B */
+ 	vli_mod_sub(t6, t7, x1, curve_prime, ndigits);
+ 	/* t6 = (y2 + y1)*(x3' - B) */
+-	vli_mod_mult_fast(t6, t6, t5, curve_prime, ndigits);
++	vli_mod_mult_fast(t6, t6, t5, curve);
+ 	/* t2 = y3' */
+ 	vli_mod_sub(y1, t6, y1, curve_prime, ndigits);
+ 
+@@ -872,55 +1288,119 @@
+ 	vli_set(rx[1], point->x, ndigits);
+ 	vli_set(ry[1], point->y, ndigits);
+ 
+-	xycz_initial_double(rx[1], ry[1], rx[0], ry[0], initial_z, curve_prime,
+-			    ndigits);
++	xycz_initial_double(rx[1], ry[1], rx[0], ry[0], initial_z, curve);
+ 
+ 	for (i = num_bits - 2; i > 0; i--) {
+ 		nb = !vli_test_bit(scalar, i);
+-		xycz_add_c(rx[1 - nb], ry[1 - nb], rx[nb], ry[nb], curve_prime,
+-			   ndigits);
+-		xycz_add(rx[nb], ry[nb], rx[1 - nb], ry[1 - nb], curve_prime,
+-			 ndigits);
++		xycz_add_c(rx[1 - nb], ry[1 - nb], rx[nb], ry[nb], curve);
++		xycz_add(rx[nb], ry[nb], rx[1 - nb], ry[1 - nb], curve);
+ 	}
+ 
+ 	nb = !vli_test_bit(scalar, 0);
+-	xycz_add_c(rx[1 - nb], ry[1 - nb], rx[nb], ry[nb], curve_prime,
+-		   ndigits);
++	xycz_add_c(rx[1 - nb], ry[1 - nb], rx[nb], ry[nb], curve);
+ 
+ 	/* Find final 1/Z value. */
+ 	/* X1 - X0 */
+ 	vli_mod_sub(z, rx[1], rx[0], curve_prime, ndigits);
+ 	/* Yb * (X1 - X0) */
+-	vli_mod_mult_fast(z, z, ry[1 - nb], curve_prime, ndigits);
++	vli_mod_mult_fast(z, z, ry[1 - nb], curve);
+ 	/* xP * Yb * (X1 - X0) */
+-	vli_mod_mult_fast(z, z, point->x, curve_prime, ndigits);
++	vli_mod_mult_fast(z, z, point->x, curve);
+ 
+ 	/* 1 / (xP * Yb * (X1 - X0)) */
+ 	vli_mod_inv(z, z, curve_prime, point->ndigits);
+ 
+ 	/* yP / (xP * Yb * (X1 - X0)) */
+-	vli_mod_mult_fast(z, z, point->y, curve_prime, ndigits);
++	vli_mod_mult_fast(z, z, point->y, curve);
+ 	/* Xb * yP / (xP * Yb * (X1 - X0)) */
+-	vli_mod_mult_fast(z, z, rx[1 - nb], curve_prime, ndigits);
++	vli_mod_mult_fast(z, z, rx[1 - nb], curve);
+ 	/* End 1/Z calculation */
+ 
+-	xycz_add(rx[nb], ry[nb], rx[1 - nb], ry[1 - nb], curve_prime, ndigits);
+-
+-	apply_z(rx[0], ry[0], z, curve_prime, ndigits);
++	xycz_add(rx[nb], ry[nb], rx[1 - nb], ry[1 - nb], curve);
++
++	apply_z(rx[0], ry[0], z, curve);
+ 
+ 	vli_set(result->x, rx[0], ndigits);
+ 	vli_set(result->y, ry[0], ndigits);
+ }
+ 
+-static inline void ecc_swap_digits(const u64 *in, u64 *out,
+-				   unsigned int ndigits)
+-{
+-	const __be64 *src = (__force __be64 *)in;
++/* Computes R = P + Q mod p */
++static void ecc_point_add(const struct ecc_point *result,
++		   const struct ecc_point *p, const struct ecc_point *q,
++		   const struct ecc_curve *curve)
++{
++	u64 z[ECC_MAX_DIGITS];
++	u64 px[ECC_MAX_DIGITS];
++	u64 py[ECC_MAX_DIGITS];
++	unsigned int ndigits = curve->g.ndigits;
++
++	vli_set(result->x, q->x, ndigits);
++	vli_set(result->y, q->y, ndigits);
++	vli_mod_sub(z, result->x, p->x, curve->p, ndigits);
++	vli_set(px, p->x, ndigits);
++	vli_set(py, p->y, ndigits);
++	xycz_add(px, py, result->x, result->y, curve);
++	vli_mod_inv(z, z, curve->p, ndigits);
++	apply_z(result->x, result->y, z, curve);
++}
++
++/* Computes R = u1P + u2Q mod p using Shamir's trick.
++ * Based on: Kenneth MacKay's micro-ecc (2014).
++ */
++void ecc_point_mult_shamir(const struct ecc_point *result,
++			   const u64 *u1, const struct ecc_point *p,
++			   const u64 *u2, const struct ecc_point *q,
++			   const struct ecc_curve *curve)
++{
++	u64 z[ECC_MAX_DIGITS];
++	u64 sump[2][ECC_MAX_DIGITS];
++	u64 *rx = result->x;
++	u64 *ry = result->y;
++	unsigned int ndigits = curve->g.ndigits;
++	unsigned int num_bits;
++	struct ecc_point sum = ECC_POINT_INIT(sump[0], sump[1], ndigits);
++	const struct ecc_point *points[4];
++	const struct ecc_point *point;
++	unsigned int idx;
+ 	int i;
+ 
+-	for (i = 0; i < ndigits; i++)
+-		out[i] = be64_to_cpu(src[ndigits - 1 - i]);
+-}
++	ecc_point_add(&sum, p, q, curve);
++	points[0] = NULL;
++	points[1] = p;
++	points[2] = q;
++	points[3] = &sum;
++
++	num_bits = max(vli_num_bits(u1, ndigits), vli_num_bits(u2, ndigits));
++	i = num_bits - 1;
++	idx = (!!vli_test_bit(u1, i)) | ((!!vli_test_bit(u2, i)) << 1);
++	point = points[idx];
++
++	vli_set(rx, point->x, ndigits);
++	vli_set(ry, point->y, ndigits);
++	vli_clear(z + 1, ndigits - 1);
++	z[0] = 1;
++
++	for (--i; i >= 0; i--) {
++		ecc_point_double_jacobian(rx, ry, z, curve);
++		idx = (!!vli_test_bit(u1, i)) | ((!!vli_test_bit(u2, i)) << 1);
++		point = points[idx];
++		if (point) {
++			u64 tx[ECC_MAX_DIGITS];
++			u64 ty[ECC_MAX_DIGITS];
++			u64 tz[ECC_MAX_DIGITS];
++
++			vli_set(tx, point->x, ndigits);
++			vli_set(ty, point->y, ndigits);
++			apply_z(tx, ty, z, curve);
++			vli_mod_sub(tz, rx, tx, curve->p, ndigits);
++			xycz_add(tx, ty, rx, ry, curve);
++			vli_mod_mult_fast(z, z, tz, curve);
++		}
++	}
++	vli_mod_inv(z, z, curve->p, ndigits);
++	apply_z(rx, ry, z, curve);
++}
++EXPORT_SYMBOL(ecc_point_mult_shamir);
+ 
+ static int __ecc_is_key_valid(const struct ecc_curve *curve,
+ 			      const u64 *private_key, unsigned int ndigits)
+@@ -958,6 +1438,7 @@
+ 
+ 	return __ecc_is_key_valid(curve, private_key, ndigits);
+ }
++EXPORT_SYMBOL(ecc_is_key_valid);
+ 
+ /*
+  * ECC private keys are generated using the method of extra random bits,
+@@ -1010,6 +1491,7 @@
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL(ecc_gen_privkey);
+ 
+ int ecc_make_pub_key(unsigned int curve_id, unsigned int ndigits,
+ 		     const u64 *private_key, u64 *public_key)
+@@ -1033,7 +1515,9 @@
+ 	}
+ 
+ 	ecc_point_mult(pk, &curve->g, priv, NULL, curve, ndigits);
+-	if (ecc_point_is_zero(pk)) {
++
++	/* SP800-56A rev 3 5.6.2.1.3 key check */
++	if (ecc_is_pubkey_valid_full(curve, pk)) {
+ 		ret = -EAGAIN;
+ 		goto err_free_point;
+ 	}
+@@ -1046,12 +1530,16 @@
+ out:
+ 	return ret;
+ }
++EXPORT_SYMBOL(ecc_make_pub_key);
+ 
+ /* SP800-56A section 5.6.2.3.4 partial verification: ephemeral keys only */
+-static int ecc_is_pubkey_valid_partial(const struct ecc_curve *curve,
+-				       struct ecc_point *pk)
++int ecc_is_pubkey_valid_partial(const struct ecc_curve *curve,
++				struct ecc_point *pk)
+ {
+ 	u64 yy[ECC_MAX_DIGITS], xxx[ECC_MAX_DIGITS], w[ECC_MAX_DIGITS];
++
++	if (WARN_ON(pk->ndigits != curve->g.ndigits))
++		return -EINVAL;
+ 
+ 	/* Check 1: Verify key is not the zero point. */
+ 	if (ecc_point_is_zero(pk))
+@@ -1064,18 +1552,45 @@
+ 		return -EINVAL;
+ 
+ 	/* Check 3: Verify that y^2 == (x^3 + a·x + b) mod p */
+-	vli_mod_square_fast(yy, pk->y, curve->p, pk->ndigits); /* y^2 */
+-	vli_mod_square_fast(xxx, pk->x, curve->p, pk->ndigits); /* x^2 */
+-	vli_mod_mult_fast(xxx, xxx, pk->x, curve->p, pk->ndigits); /* x^3 */
+-	vli_mod_mult_fast(w, curve->a, pk->x, curve->p, pk->ndigits); /* a·x */
++	vli_mod_square_fast(yy, pk->y, curve); /* y^2 */
++	vli_mod_square_fast(xxx, pk->x, curve); /* x^2 */
++	vli_mod_mult_fast(xxx, xxx, pk->x, curve); /* x^3 */
++	vli_mod_mult_fast(w, curve->a, pk->x, curve); /* a·x */
+ 	vli_mod_add(w, w, curve->b, curve->p, pk->ndigits); /* a·x + b */
+ 	vli_mod_add(w, w, xxx, curve->p, pk->ndigits); /* x^3 + a·x + b */
+ 	if (vli_cmp(yy, w, pk->ndigits) != 0) /* Equation */
+ 		return -EINVAL;
+ 
+ 	return 0;
+-
+-}
++}
++EXPORT_SYMBOL(ecc_is_pubkey_valid_partial);
++
++/* SP800-56A section 5.6.2.3.3 full verification */
++int ecc_is_pubkey_valid_full(const struct ecc_curve *curve,
++			     struct ecc_point *pk)
++{
++	struct ecc_point *nQ;
++
++	/* Checks 1 through 3 */
++	int ret = ecc_is_pubkey_valid_partial(curve, pk);
++
++	if (ret)
++		return ret;
++
++	/* Check 4: Verify that nQ is the zero point. */
++	nQ = ecc_alloc_point(pk->ndigits);
++	if (!nQ)
++		return -ENOMEM;
++
++	ecc_point_mult(nQ, pk, curve->n, NULL, curve, pk->ndigits);
++	if (!ecc_point_is_zero(nQ))
++		ret = -EINVAL;
++
++	ecc_free_point(nQ);
++
++	return ret;
++}
++EXPORT_SYMBOL(ecc_is_pubkey_valid_full);
+ 
+ int crypto_ecdh_shared_secret(unsigned int curve_id, unsigned int ndigits,
+ 			      const u64 *private_key, const u64 *public_key,
+@@ -1120,14 +1635,23 @@
+ 
+ 	ecc_point_mult(product, pk, priv, rand_z, curve, ndigits);
+ 
++	if (ecc_point_is_zero(product)) {
++		ret = -EFAULT;
++		goto err_validity;
++	}
++
+ 	ecc_swap_digits(product->x, secret, ndigits);
+ 
+-	if (ecc_point_is_zero(product))
+-		ret = -EFAULT;
+-
++err_validity:
++	memzero_explicit(priv, sizeof(priv));
++	memzero_explicit(rand_z, sizeof(rand_z));
+ 	ecc_free_point(product);
+ err_alloc_product:
+ 	ecc_free_point(pk);
+ out:
+ 	return ret;
+ }
++EXPORT_SYMBOL(crypto_ecdh_shared_secret);
++
++MODULE_LICENSE("Dual BSD/GPL");
++
+--- a/crypto/ecc.h
++++ b/crypto/ecc.h
+@@ -26,11 +26,75 @@
+ #ifndef _CRYPTO_ECC_H
+ #define _CRYPTO_ECC_H
+ 
++/* One digit is u64 qword. */
+ #define ECC_CURVE_NIST_P192_DIGITS  3
+ #define ECC_CURVE_NIST_P256_DIGITS  4
+-#define ECC_MAX_DIGITS              ECC_CURVE_NIST_P256_DIGITS
++#define ECC_CURVE_NIST_P384_DIGITS  6
++#define ECC_MAX_DIGITS              (512 / 64) /* due to ecrdsa */
+ 
+ #define ECC_DIGITS_TO_BYTES_SHIFT 3
++
++#define ECC_MAX_BYTES (ECC_MAX_DIGITS << ECC_DIGITS_TO_BYTES_SHIFT)
++
++/**
++ * struct ecc_point - elliptic curve point in affine coordinates
++ *
++ * @x:		X coordinate in vli form.
++ * @y:		Y coordinate in vli form.
++ * @ndigits:	Length of vlis in u64 qwords.
++ */
++struct ecc_point {
++	u64 *x;
++	u64 *y;
++	u8 ndigits;
++};
++
++#define ECC_POINT_INIT(x, y, ndigits)	(struct ecc_point) { x, y, ndigits }
++
++/**
++ * struct ecc_curve - definition of elliptic curve
++ *
++ * @name:	Short name of the curve.
++ * @g:		Generator point of the curve.
++ * @p:		Prime number, if Barrett's reduction is used for this curve
++ *		pre-calculated value 'mu' is appended to the @p after ndigits.
++ *		Use of Barrett's reduction is heuristically determined in
++ *		vli_mmod_fast().
++ * @n:		Order of the curve group.
++ * @a:		Curve parameter a.
++ * @b:		Curve parameter b.
++ */
++struct ecc_curve {
++	char *name;
++	struct ecc_point g;
++	u64 *p;
++	u64 *n;
++	u64 *a;
++	u64 *b;
++};
++
++/**
++ * ecc_swap_digits() - Copy ndigits from big endian array to native array
++ * @in:       Input array
++ * @out:      Output array
++ * @ndigits:  Number of digits to copy
++ */
++static inline void ecc_swap_digits(const u64 *in, u64 *out, unsigned int ndigits)
++{
++	const __be64 *src = (__force __be64 *)in;
++	int i;
++
++	for (i = 0; i < ndigits; i++)
++		out[i] = be64_to_cpu(src[ndigits - 1 - i]);
++}
++
++/**
++ * ecc_get_curve()  - Get a curve given its curve_id
++ * @curve_id:  Id of the curve
++ *
++ * Returns pointer to the curve data, NULL if curve is not available
++ */
++const struct ecc_curve *ecc_get_curve(unsigned int curve_id);
+ 
+ /**
+  * ecc_is_key_valid() - Validate a given ECDH private key
+@@ -91,4 +155,132 @@
+ int crypto_ecdh_shared_secret(unsigned int curve_id, unsigned int ndigits,
+ 			      const u64 *private_key, const u64 *public_key,
+ 			      u64 *secret);
++
++/**
++ * ecc_is_pubkey_valid_partial() - Partial public key validation
++ *
++ * @curve:		elliptic curve domain parameters
++ * @pk:			public key as a point
++ *
++ * Valdiate public key according to SP800-56A section 5.6.2.3.4 ECC Partial
++ * Public-Key Validation Routine.
++ *
++ * Note: There is no check that the public key is in the correct elliptic curve
++ * subgroup.
++ *
++ * Return: 0 if validation is successful, -EINVAL if validation is failed.
++ */
++int ecc_is_pubkey_valid_partial(const struct ecc_curve *curve,
++				struct ecc_point *pk);
++
++/**
++ * ecc_is_pubkey_valid_full() - Full public key validation
++ *
++ * @curve:		elliptic curve domain parameters
++ * @pk:			public key as a point
++ *
++ * Valdiate public key according to SP800-56A section 5.6.2.3.3 ECC Full
++ * Public-Key Validation Routine.
++ *
++ * Return: 0 if validation is successful, -EINVAL if validation is failed.
++ */
++int ecc_is_pubkey_valid_full(const struct ecc_curve *curve,
++			     struct ecc_point *pk);
++
++/**
++ * vli_is_zero() - Determine is vli is zero
++ *
++ * @vli:		vli to check.
++ * @ndigits:		length of the @vli
++ */
++bool vli_is_zero(const u64 *vli, unsigned int ndigits);
++
++/**
++ * vli_cmp() - compare left and right vlis
++ *
++ * @left:		vli
++ * @right:		vli
++ * @ndigits:		length of both vlis
++ *
++ * Returns sign of @left - @right, i.e. -1 if @left < @right,
++ * 0 if @left == @right, 1 if @left > @right.
++ */
++int vli_cmp(const u64 *left, const u64 *right, unsigned int ndigits);
++
++/**
++ * vli_sub() - Subtracts right from left
++ *
++ * @result:		where to write result
++ * @left:		vli
++ * @right		vli
++ * @ndigits:		length of all vlis
++ *
++ * Note: can modify in-place.
++ *
++ * Return: carry bit.
++ */
++u64 vli_sub(u64 *result, const u64 *left, const u64 *right,
++	    unsigned int ndigits);
++
++/**
++ * vli_from_be64() - Load vli from big-endian u64 array
++ *
++ * @dest:		destination vli
++ * @src:		source array of u64 BE values
++ * @ndigits:		length of both vli and array
++ */
++void vli_from_be64(u64 *dest, const void *src, unsigned int ndigits);
++
++/**
++ * vli_from_le64() - Load vli from little-endian u64 array
++ *
++ * @dest:		destination vli
++ * @src:		source array of u64 LE values
++ * @ndigits:		length of both vli and array
++ */
++void vli_from_le64(u64 *dest, const void *src, unsigned int ndigits);
++
++/**
++ * vli_mod_inv() - Modular inversion
++ *
++ * @result:		where to write vli number
++ * @input:		vli value to operate on
++ * @mod:		modulus
++ * @ndigits:		length of all vlis
++ */
++void vli_mod_inv(u64 *result, const u64 *input, const u64 *mod,
++		 unsigned int ndigits);
++
++/**
++ * vli_mod_mult_slow() - Modular multiplication
++ *
++ * @result:		where to write result value
++ * @left:		vli number to multiply with @right
++ * @right:		vli number to multiply with @left
++ * @mod:		modulus
++ * @ndigits:		length of all vlis
++ *
++ * Note: Assumes that mod is big enough curve order.
++ */
++void vli_mod_mult_slow(u64 *result, const u64 *left, const u64 *right,
++		       const u64 *mod, unsigned int ndigits);
++
++/**
++ * ecc_point_mult_shamir() - Add two points multiplied by scalars
++ *
++ * @result:		resulting point
++ * @x:			scalar to multiply with @p
++ * @p:			point to multiply with @x
++ * @y:			scalar to multiply with @q
++ * @q:			point to multiply with @y
++ * @curve:		curve
++ *
++ * Returns result = x * p + x * q over the curve.
++ * This works faster than two multiplications and addition.
++ */
++void ecc_point_mult_shamir(const struct ecc_point *result,
++			   const u64 *x, const struct ecc_point *p,
++			   const u64 *y, const struct ecc_point *q,
++			   const struct ecc_curve *curve);
+ #endif
++
+--- a/crypto/ecc_curve_defs.h
++++ b/crypto/ecc_curve_defs.h
+@@ -1,21 +1,6 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ #ifndef _CRYTO_ECC_CURVE_DEFS_H
+ #define _CRYTO_ECC_CURVE_DEFS_H
+-
+-struct ecc_point {
+-	u64 *x;
+-	u64 *y;
+-	u8 ndigits;
+-};
+-
+-struct ecc_curve {
+-	char *name;
+-	struct ecc_point g;
+-	u64 *p;
+-	u64 *n;
+-	u64 *a;
+-	u64 *b;
+-};
+ 
+ /* NIST P-192: a = p - 3 */
+ static u64 nist_p192_g_x[] = { 0xF4FF0AFD82FF1012ull, 0x7CBF20EB43A18800ull,
+@@ -69,4 +54,37 @@
+ 	.b = nist_p256_b
+ };
+ 
++/* NIST P-384 */
++static u64 nist_p384_g_x[] = { 0x3A545E3872760AB7ull, 0x5502F25DBF55296Cull,
++				0x59F741E082542A38ull, 0x6E1D3B628BA79B98ull,
++				0x8Eb1C71EF320AD74ull, 0xAA87CA22BE8B0537ull };
++static u64 nist_p384_g_y[] = { 0x7A431D7C90EA0E5Full, 0x0A60B1CE1D7E819Dull,
++				0xE9DA3113B5F0B8C0ull, 0xF8F41DBD289A147Cull,
++				0x5D9E98BF9292DC29ull, 0x3617DE4A96262C6Full };
++static u64 nist_p384_p[] = { 0x00000000FFFFFFFFull, 0xFFFFFFFF00000000ull,
++				0xFFFFFFFFFFFFFFFEull, 0xFFFFFFFFFFFFFFFFull,
++				0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull };
++static u64 nist_p384_n[] = { 0xECEC196ACCC52973ull, 0x581A0DB248B0A77Aull,
++				0xC7634D81F4372DDFull, 0xFFFFFFFFFFFFFFFFull,
++				0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull };
++static u64 nist_p384_a[] = { 0x00000000FFFFFFFCull, 0xFFFFFFFF00000000ull,
++				0xFFFFFFFFFFFFFFFEull, 0xFFFFFFFFFFFFFFFFull,
++				0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull };
++static u64 nist_p384_b[] = { 0x2a85c8edd3ec2aefull, 0xc656398d8a2ed19dull,
++				0x0314088f5013875aull, 0x181d9c6efe814112ull,
++				0x988e056be3f82d19ull, 0xb3312fa7e23ee7e4ull };
++static struct ecc_curve nist_p384 = {
++	.name = "nist_384",
++	.g = {
++		.x = nist_p384_g_x,
++		.y = nist_p384_g_y,
++		.ndigits = 6,
++	},
++	.p = nist_p384_p,
++	.n = nist_p384_n,
++	.a = nist_p384_a,
++	.b = nist_p384_b
++};
++
+ #endif
++
+--- /dev/null
++++ b/crypto/ecdsa.c
+@@ -0,0 +1,377 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (c) 2021 IBM Corporation
++ */
++
++#include <linux/module.h>
++#include <crypto/internal/akcipher.h>
++#include <crypto/akcipher.h>
++#include <crypto/ecdh.h>
++#include <linux/asn1_decoder.h>
++#include <linux/scatterlist.h>
++
++#include "ecc.h"
++#include "ecdsasignature.asn1.h"
++
++struct ecc_ctx {
++	unsigned int curve_id;
++	const struct ecc_curve *curve;
++
++	bool pub_key_set;
++	u64 x[ECC_MAX_DIGITS]; /* pub key x and y coordinates */
++	u64 y[ECC_MAX_DIGITS];
++	struct ecc_point pub_key;
++};
++
++struct ecdsa_signature_ctx {
++	const struct ecc_curve *curve;
++	u64 r[ECC_MAX_DIGITS];
++	u64 s[ECC_MAX_DIGITS];
++};
++
++/*
++ * Get the r and s components of a signature from the X509 certificate.
++ */
++static int ecdsa_get_signature_rs(u64 *dest, size_t hdrlen, unsigned char tag,
++				  const void *value, size_t vlen, unsigned int ndigits)
++{
++	size_t keylen = ndigits * sizeof(u64);
++	ssize_t diff = vlen - keylen;
++	const char *d = value;
++	u8 rs[ECC_MAX_BYTES];
++
++	if (!value || !vlen)
++		return -EINVAL;
++
++	/* diff = 0: 'value' has exacly the right size
++	 * diff > 0: 'value' has too many bytes; one leading zero is allowed that
++	 *           makes the value a positive integer; error on more
++	 * diff < 0: 'value' is missing leading zeros, which we add
++	 */
++	if (diff > 0) {
++		/* skip over leading zeros that make 'value' a positive int */
++		if (*d == 0) {
++			vlen -= 1;
++			diff--;
++			d++;
++		}
++		if (diff)
++			return -EINVAL;
++	}
++	if (-diff >= keylen)
++		return -EINVAL;
++
++	if (diff) {
++		/* leading zeros not given in 'value' */
++		memset(rs, 0, -diff);
++	}
++
++	memcpy(&rs[-diff], d, vlen);
++
++	ecc_swap_digits((u64 *)rs, dest, ndigits);
++
++	return 0;
++}
++
++int ecdsa_get_signature_r(void *context, size_t hdrlen, unsigned char tag,
++			  const void *value, size_t vlen)
++{
++	struct ecdsa_signature_ctx *sig = context;
++
++	return ecdsa_get_signature_rs(sig->r, hdrlen, tag, value, vlen,
++				      sig->curve->g.ndigits);
++}
++
++int ecdsa_get_signature_s(void *context, size_t hdrlen, unsigned char tag,
++			  const void *value, size_t vlen)
++{
++	struct ecdsa_signature_ctx *sig = context;
++
++	return ecdsa_get_signature_rs(sig->s, hdrlen, tag, value, vlen,
++				      sig->curve->g.ndigits);
++}
++
++static int _ecdsa_verify(struct ecc_ctx *ctx, const u64 *hash, const u64 *r, const u64 *s)
++{
++	const struct ecc_curve *curve = ctx->curve;
++	unsigned int ndigits = curve->g.ndigits;
++	u64 s1[ECC_MAX_DIGITS];
++	u64 u1[ECC_MAX_DIGITS];
++	u64 u2[ECC_MAX_DIGITS];
++	u64 x1[ECC_MAX_DIGITS];
++	u64 y1[ECC_MAX_DIGITS];
++	struct ecc_point res = ECC_POINT_INIT(x1, y1, ndigits);
++
++	/* 0 < r < n  and 0 < s < n */
++	if (vli_is_zero(r, ndigits) || vli_cmp(r, curve->n, ndigits) >= 0 ||
++	    vli_is_zero(s, ndigits) || vli_cmp(s, curve->n, ndigits) >= 0)
++		return -EBADMSG;
++
++	/* hash is given */
++	pr_devel("hash : %016llx %016llx ... %016llx\n",
++		 hash[ndigits - 1], hash[ndigits - 2], hash[0]);
++
++	/* s1 = (s^-1) mod n */
++	vli_mod_inv(s1, s, curve->n, ndigits);
++	/* u1 = (hash * s1) mod n */
++	vli_mod_mult_slow(u1, hash, s1, curve->n, ndigits);
++	/* u2 = (r * s1) mod n */
++	vli_mod_mult_slow(u2, r, s1, curve->n, ndigits);
++	/* res = u1*G + u2 * pub_key */
++	ecc_point_mult_shamir(&res, u1, &curve->g, u2, &ctx->pub_key, curve);
++
++	/* res.x = res.x mod n (if res.x > order) */
++	if (unlikely(vli_cmp(res.x, curve->n, ndigits) == 1))
++		/* faster alternative for NIST p384, p256 & p192 */
++		vli_sub(res.x, res.x, curve->n, ndigits);
++
++	if (!vli_cmp(res.x, r, ndigits))
++		return 0;
++
++	return -EKEYREJECTED;
++}
++
++/*
++ * Verify an ECDSA signature.
++ */
++static int ecdsa_verify(struct akcipher_request *req)
++{
++	struct crypto_akcipher *tfm = crypto_akcipher_reqtfm(req);
++	struct ecc_ctx *ctx = akcipher_tfm_ctx(tfm);
++	size_t keylen = ctx->curve->g.ndigits * sizeof(u64);
++	struct ecdsa_signature_ctx sig_ctx = {
++		.curve = ctx->curve,
++	};
++	u8 rawhash[ECC_MAX_BYTES];
++	u64 hash[ECC_MAX_DIGITS];
++	unsigned char *buffer;
++	ssize_t diff;
++	int ret;
++
++	if (unlikely(!ctx->pub_key_set))
++		return -EINVAL;
++
++	buffer = kmalloc(req->src_len + req->dst_len, GFP_KERNEL);
++	if (!buffer)
++		return -ENOMEM;
++
++	sg_pcopy_to_buffer(req->src,
++		sg_nents_for_len(req->src, req->src_len + req->dst_len),
++		buffer, req->src_len + req->dst_len, 0);
++
++	ret = asn1_ber_decoder(&ecdsasignature_decoder, &sig_ctx,
++			       buffer, req->src_len);
++	if (ret < 0)
++		goto error;
++
++	/* if the hash is shorter then we will add leading zeros to fit to ndigits */
++	diff = keylen - req->dst_len;
++	if (diff >= 0) {
++		if (diff)
++			memset(rawhash, 0, diff);
++		memcpy(&rawhash[diff], buffer + req->src_len, req->dst_len);
++	} else if (diff < 0) {
++		/* given hash is longer, we take the left-most bytes */
++		memcpy(&rawhash, buffer + req->src_len, keylen);
++	}
++
++	ecc_swap_digits((u64 *)rawhash, hash, ctx->curve->g.ndigits);
++
++	ret = _ecdsa_verify(ctx, hash, sig_ctx.r, sig_ctx.s);
++
++error:
++	kfree(buffer);
++
++	return ret;
++}
++
++static int ecdsa_ecc_ctx_init(struct ecc_ctx *ctx, unsigned int curve_id)
++{
++	ctx->curve_id = curve_id;
++	ctx->curve = ecc_get_curve(curve_id);
++	if (!ctx->curve)
++		return -EINVAL;
++
++	return 0;
++}
++
++
++static void ecdsa_ecc_ctx_deinit(struct ecc_ctx *ctx)
++{
++	ctx->pub_key_set = false;
++}
++
++static int ecdsa_ecc_ctx_reset(struct ecc_ctx *ctx)
++{
++	unsigned int curve_id = ctx->curve_id;
++	int ret;
++
++	ecdsa_ecc_ctx_deinit(ctx);
++	ret = ecdsa_ecc_ctx_init(ctx, curve_id);
++	if (ret == 0)
++		ctx->pub_key = ECC_POINT_INIT(ctx->x, ctx->y,
++					      ctx->curve->g.ndigits);
++	return ret;
++}
++
++/*
++ * Set the public key given the raw uncompressed key data from an X509
++ * certificate. The key data contain the concatenated X and Y coordinates of
++ * the public key.
++ */
++static int ecdsa_set_pub_key(struct crypto_akcipher *tfm, const void *key, unsigned int keylen)
++{
++	struct ecc_ctx *ctx = akcipher_tfm_ctx(tfm);
++	const unsigned char *d = key;
++	const u64 *digits = (const u64 *)&d[1];
++	unsigned int ndigits;
++	int ret;
++
++	ret = ecdsa_ecc_ctx_reset(ctx);
++	if (ret < 0)
++		return ret;
++
++	if (keylen < 1 || (((keylen - 1) >> 1) % sizeof(u64)) != 0)
++		return -EINVAL;
++	/* we only accept uncompressed format indicated by '4' */
++	if (d[0] != 4)
++		return -EINVAL;
++
++	keylen--;
++	ndigits = (keylen >> 1) / sizeof(u64);
++	if (ndigits != ctx->curve->g.ndigits)
++		return -EINVAL;
++
++	ecc_swap_digits(digits, ctx->pub_key.x, ndigits);
++	ecc_swap_digits(&digits[ndigits], ctx->pub_key.y, ndigits);
++	ret = ecc_is_pubkey_valid_full(ctx->curve, &ctx->pub_key);
++
++	ctx->pub_key_set = ret == 0;
++
++	return ret;
++}
++
++static void ecdsa_exit_tfm(struct crypto_akcipher *tfm)
++{
++	struct ecc_ctx *ctx = akcipher_tfm_ctx(tfm);
++
++	ecdsa_ecc_ctx_deinit(ctx);
++}
++
++static unsigned int ecdsa_max_size(struct crypto_akcipher *tfm)
++{
++	struct ecc_ctx *ctx = akcipher_tfm_ctx(tfm);
++
++	return ctx->pub_key.ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
++}
++
++static int ecdsa_nist_p384_init_tfm(struct crypto_akcipher *tfm)
++{
++	struct ecc_ctx *ctx = akcipher_tfm_ctx(tfm);
++
++	return ecdsa_ecc_ctx_init(ctx, ECC_CURVE_NIST_P384);
++}
++
++static struct akcipher_alg ecdsa_nist_p384 = {
++	.verify = ecdsa_verify,
++	.set_pub_key = ecdsa_set_pub_key,
++	.max_size = ecdsa_max_size,
++	.init = ecdsa_nist_p384_init_tfm,
++	.exit = ecdsa_exit_tfm,
++	.base = {
++		.cra_name = "ecdsa-nist-p384",
++		.cra_driver_name = "ecdsa-nist-p384-generic",
++		.cra_priority = 100,
++		.cra_module = THIS_MODULE,
++		.cra_ctxsize = sizeof(struct ecc_ctx),
++	},
++};
++
++static int ecdsa_nist_p256_init_tfm(struct crypto_akcipher *tfm)
++{
++	struct ecc_ctx *ctx = akcipher_tfm_ctx(tfm);
++
++	return ecdsa_ecc_ctx_init(ctx, ECC_CURVE_NIST_P256);
++}
++
++static struct akcipher_alg ecdsa_nist_p256 = {
++	.verify = ecdsa_verify,
++	.set_pub_key = ecdsa_set_pub_key,
++	.max_size = ecdsa_max_size,
++	.init = ecdsa_nist_p256_init_tfm,
++	.exit = ecdsa_exit_tfm,
++	.base = {
++		.cra_name = "ecdsa-nist-p256",
++		.cra_driver_name = "ecdsa-nist-p256-generic",
++		.cra_priority = 100,
++		.cra_module = THIS_MODULE,
++		.cra_ctxsize = sizeof(struct ecc_ctx),
++	},
++};
++
++static int ecdsa_nist_p192_init_tfm(struct crypto_akcipher *tfm)
++{
++	struct ecc_ctx *ctx = akcipher_tfm_ctx(tfm);
++
++	return ecdsa_ecc_ctx_init(ctx, ECC_CURVE_NIST_P192);
++}
++
++static struct akcipher_alg ecdsa_nist_p192 = {
++	.verify = ecdsa_verify,
++	.set_pub_key = ecdsa_set_pub_key,
++	.max_size = ecdsa_max_size,
++	.init = ecdsa_nist_p192_init_tfm,
++	.exit = ecdsa_exit_tfm,
++	.base = {
++		.cra_name = "ecdsa-nist-p192",
++		.cra_driver_name = "ecdsa-nist-p192-generic",
++		.cra_priority = 100,
++		.cra_module = THIS_MODULE,
++		.cra_ctxsize = sizeof(struct ecc_ctx),
++	},
++};
++static bool ecdsa_nist_p192_registered;
++
++static int ecdsa_init(void)
++{
++	int ret;
++
++	/* NIST p192 may not be available in FIPS mode */
++	ret = crypto_register_akcipher(&ecdsa_nist_p192);
++	ecdsa_nist_p192_registered = ret == 0;
++
++	ret = crypto_register_akcipher(&ecdsa_nist_p256);
++	if (ret)
++		goto nist_p256_error;
++
++	ret = crypto_register_akcipher(&ecdsa_nist_p384);
++	if (ret)
++		goto nist_p384_error;
++
++	return 0;
++
++nist_p384_error:
++	crypto_unregister_akcipher(&ecdsa_nist_p256);
++
++nist_p256_error:
++	if (ecdsa_nist_p192_registered)
++		crypto_unregister_akcipher(&ecdsa_nist_p192);
++	return ret;
++}
++
++static void ecdsa_exit(void)
++{
++	if (ecdsa_nist_p192_registered)
++		crypto_unregister_akcipher(&ecdsa_nist_p192);
++	crypto_unregister_akcipher(&ecdsa_nist_p256);
++	crypto_unregister_akcipher(&ecdsa_nist_p384);
++}
++
++subsys_initcall(ecdsa_init);
++module_exit(ecdsa_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Stefan Berger <stefanb@linux.ibm.com>");
++MODULE_DESCRIPTION("ECDSA generic algorithm");
++MODULE_ALIAS_CRYPTO("ecdsa-generic");
++
+--- /dev/null
++++ b/crypto/ecdsasignature.asn1
+@@ -0,0 +1,5 @@
++ECDSASignature ::= SEQUENCE {
++	r	INTEGER ({ ecdsa_get_signature_r }),
++	s	INTEGER ({ ecdsa_get_signature_s })
++}
++
+--- a/include/crypto/ecdh.h
++++ b/include/crypto/ecdh.h
+@@ -1,14 +1,9 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
+ /*
+  * ECDH params to be used with kpp API
+  *
+  * Copyright (c) 2016, Intel Corporation
+  * Authors: Salvatore Benedetto <salvatore.benedetto@intel.com>
+- *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License as published by the Free
+- * Software Foundation; either version 2 of the License, or (at your option)
+- * any later version.
+- *
+  */
+ #ifndef _CRYPTO_ECDH_
+ #define _CRYPTO_ECDH_
+@@ -30,6 +25,7 @@
+ /* Curves IDs */
+ #define ECC_CURVE_NIST_P192	0x0001
+ #define ECC_CURVE_NIST_P256	0x0002
++#define ECC_CURVE_NIST_P384	0x0003
+ 
+ /**
+  * struct ecdh - define an ECDH private key
+@@ -86,3 +82,4 @@
+ int crypto_ecdh_decode_key(const char *buf, unsigned int len, struct ecdh *p);
+ 
+ #endif
++
+--- a/crypto/Makefile
++++ b/crypto/Makefile
+@@ -166,8 +166,8 @@
+ obj-$(CONFIG_CRYPTO_USER_API_AEAD) += algif_aead.o
+ obj-$(CONFIG_CRYPTO_ZSTD) += zstd.o
+ 
+-ecdh_generic-y := ecc.o
+-ecdh_generic-y += ecdh.o
++obj-$(CONFIG_CRYPTO_ECC) += ecc.o
++ecdh_generic-y := ecdh.o
+ ecdh_generic-y += ecdh_helper.o
+ obj-$(CONFIG_CRYPTO_ECDH) += ecdh_generic.o
+ obj-$(CONFIG_CRYPTO_CURVE25519) += curve25519-generic.o
+@@ -181,3 +181,8 @@
+ obj-$(CONFIG_CRYPTO_HASH_INFO) += hash_info.o
+ crypto_simd-y := simd.o
+ obj-$(CONFIG_CRYPTO_SIMD) += crypto_simd.o
++
++$(obj)/ecdsasignature.asn1.o: $(obj)/ecdsasignature.asn1.c $(obj)/ecdsasignature.asn1.h
++$(obj)/ecdsa.o: $(obj)/ecdsasignature.asn1.h
++ecdsa_generic-y := ecdsa.o ecdsasignature.asn1.o
++obj-$(CONFIG_CRYPTO_ECDSA) += ecdsa_generic.o
+--- a/crypto/Kconfig
++++ b/crypto/Kconfig
+@@ -128,7 +128,17 @@
+ 	help
+ 	  Generic implementation of the Diffie-Hellman algorithm.
+ 
++config CRYPTO_ECC
++	tristate
++
++config CRYPTO_ECDSA
++	tristate "ECDSA signature verification (NIST P192/P256/P384)"
++	select CRYPTO_ECC
++	select CRYPTO_AKCIPHER
++	select ASN1
++
+ config CRYPTO_ECDH
++	select CRYPTO_ECC
+ 	tristate "ECDH algorithm"
+ 	select CRYPTO_KPP
+ 	select CRYPTO_RNG_DEFAULT
+--- a/crypto/asymmetric_keys/public_key.c
++++ b/crypto/asymmetric_keys/public_key.c
+@@ -68,7 +68,7 @@
+ 	struct crypto_wait cwait;
+ 	struct crypto_akcipher *tfm;
+ 	struct akcipher_request *req;
+-	struct scatterlist sig_sg, digest_sg;
++	struct scatterlist sig_sg, digest_sg, ecdsa_sg[2];
+ 	const char *alg_name;
+ 	char alg_name_buf[CRYPTO_MAX_ALG_NAME];
+ 	void *output;
+@@ -84,7 +84,11 @@
+ 	if (!sig->digest)
+ 		return -ENOPKG;
+ 
+-	alg_name = sig->pkey_algo;
++	if (strcmp(pkey->pkey_algo, sig->pkey_algo) &&
++	    !(strncmp(pkey->pkey_algo, "ecdsa-nist-", 11) == 0 &&
++	      strcmp(sig->pkey_algo, "ecdsa") == 0))
++		return -EKEYREJECTED;
++	alg_name = pkey->pkey_algo;
+ 	if (strcmp(sig->pkey_algo, "rsa") == 0) {
+ 		/* The data wangled by the RSA algorithm is typically padded
+ 		 * and encoded in some manner, such as EMSA-PKCS1-1_5 [RFC3447
+@@ -109,6 +113,24 @@
+ 	ret = crypto_akcipher_set_pub_key(tfm, pkey->key, pkey->keylen);
+ 	if (ret)
+ 		goto error_free_req;
++
++	if (strcmp(sig->pkey_algo, "ecdsa") == 0) {
++		if (strcmp(sig->hash_algo, "sha1") && strcmp(sig->hash_algo, "sha224") &&
++		    strcmp(sig->hash_algo, "sha256") && strcmp(sig->hash_algo, "sha384") &&
++		    strcmp(sig->hash_algo, "sha512")) {
++			ret = -EINVAL;
++			goto error_free_req;
++		}
++		sg_init_table(ecdsa_sg, 2);
++		sg_set_buf(&ecdsa_sg[0], sig->s, sig->s_size);
++		sg_set_buf(&ecdsa_sg[1], sig->digest, sig->digest_size);
++		akcipher_request_set_crypt(req, ecdsa_sg, NULL, sig->s_size, sig->digest_size);
++		crypto_init_wait(&cwait);
++		akcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
++			CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &cwait);
++		ret = crypto_wait_req(crypto_akcipher_verify(req), &cwait);
++		goto error_free_req;
++	}
+ 
+ 	ret = -ENOMEM;
+ 	outlen = crypto_akcipher_maxsize(tfm);
+--- a/include/linux/oid_registry.h
++++ b/include/linux/oid_registry.h
+@@ -93,6 +93,14 @@
+ 	OID_authorityKeyIdentifier,	/* 2.5.29.35 */
+ 	OID_extKeyUsage,		/* 2.5.29.37 */
+ 
++	OID_id_prime192v1,		/* 1.2.840.10045.3.1.1 */
++	OID_id_prime256v1,		/* 1.2.840.10045.3.1.7 */
++	OID_id_ecdsa_with_sha224,	/* 1.2.840.10045.4.3.1 */
++	OID_id_ecdsa_with_sha256,	/* 1.2.840.10045.4.3.2 */
++	OID_id_ecdsa_with_sha384,	/* 1.2.840.10045.4.3.3 */
++	OID_id_ecdsa_with_sha512,	/* 1.2.840.10045.4.3.4 */
++	OID_id_ansip384r1,		/* 1.3.132.0.34 */
++
+ 	OID__NR
+ };
+ 
+--- a/crypto/asymmetric_keys/x509_cert_parser.c
++++ b/crypto/asymmetric_keys/x509_cert_parser.c
+@@ -26,6 +26,7 @@
+ 	const void	*cert_start;		/* Start of cert content */
+ 	const void	*key;			/* Key data */
+ 	size_t		key_size;		/* Size of key data */
++	enum OID	curve_oid;		/* EC named-curve parameter */
+ 	enum OID	last_oid;		/* Last OID encountered */
+ 	enum OID	algo_oid;		/* Algorithm OID */
+ 	unsigned char	nr_mpi;			/* Number of MPIs stored */
+@@ -192,6 +193,26 @@
+ 	pr_debug("PubKey Algo: %u\n", ctx->last_oid);
+ 
+ 	switch (ctx->last_oid) {
++	case OID_id_ecdsa_with_sha1:
++		ctx->cert->sig->hash_algo = "sha1";
++		ctx->cert->sig->pkey_algo = "ecdsa";
++		break;
++	case OID_id_ecdsa_with_sha224:
++		ctx->cert->sig->hash_algo = "sha224";
++		ctx->cert->sig->pkey_algo = "ecdsa";
++		break;
++	case OID_id_ecdsa_with_sha256:
++		ctx->cert->sig->hash_algo = "sha256";
++		ctx->cert->sig->pkey_algo = "ecdsa";
++		break;
++	case OID_id_ecdsa_with_sha384:
++		ctx->cert->sig->hash_algo = "sha384";
++		ctx->cert->sig->pkey_algo = "ecdsa";
++		break;
++	case OID_id_ecdsa_with_sha512:
++		ctx->cert->sig->hash_algo = "sha512";
++		ctx->cert->sig->pkey_algo = "ecdsa";
++		break;
+ 	case OID_md2WithRSAEncryption:
+ 	case OID_md3WithRSAEncryption:
+ 	default:
+@@ -249,7 +270,8 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (strcmp(ctx->cert->sig->pkey_algo, "rsa") == 0) {
++	if (strcmp(ctx->cert->sig->pkey_algo, "rsa") == 0 ||
++	    strcmp(ctx->cert->sig->pkey_algo, "ecdsa") == 0) {
+ 		/* Discard the BIT STRING metadata */
+ 		if (vlen < 1 || *(const u8 *)value != 0)
+ 			return -EBADMSG;
+@@ -412,10 +434,18 @@
+ {
+ 	struct x509_parse_context *ctx = context;
+ 
+-	if (ctx->last_oid != OID_rsaEncryption)
++	if (ctx->last_oid == OID_rsaEncryption) {
++		ctx->cert->pub->pkey_algo = "rsa";
++	} else if (ctx->last_oid == OID_id_ecPublicKey) {
++		switch (ctx->curve_oid) {
++		case OID_id_prime192v1: ctx->cert->pub->pkey_algo = "ecdsa-nist-p192"; break;
++		case OID_id_prime256v1: ctx->cert->pub->pkey_algo = "ecdsa-nist-p256"; break;
++		case OID_id_ansip384r1: ctx->cert->pub->pkey_algo = "ecdsa-nist-p384"; break;
++		default: return -ENOPKG;
++		}
++	} else {
+ 		return -ENOPKG;
+-
+-	ctx->cert->pub->pkey_algo = "rsa";
++	}
+ 
+ 	/* Discard the BIT STRING metadata */
+ 	if (vlen < 1 || *(const u8 *)value != 0)
+@@ -646,3 +676,16 @@
+ 	ctx->cert->sig->auth_ids[0] = kid;
+ 	return 0;
+ }
++
++/* Named curves are DER OBJECT IDENTIFIER values; reject explicit EC params. */
++int x509_note_params(void *context, size_t hdrlen, unsigned char tag,
++		     const void *value, size_t vlen)
++{
++	struct x509_parse_context *ctx = context;
++	if (!ctx->cert->raw_subject || ctx->key || ctx->last_oid != OID_id_ecPublicKey)
++		return 0;
++	if (tag != ASN1_OID)
++		return -EBADMSG;
++	ctx->curve_oid = look_up_OID(value, vlen);
++	return 0;
++}
+--- a/crypto/asymmetric_keys/x509.asn1
++++ b/crypto/asymmetric_keys/x509.asn1
+@@ -22,7 +22,7 @@
+ 
+ AlgorithmIdentifier ::= SEQUENCE {
+ 	algorithm		OBJECT IDENTIFIER ({ x509_note_OID }),
+-	parameters		ANY OPTIONAL
++	parameters		ANY OPTIONAL ({ x509_note_params })
+ }
+ 
+ Name ::= SEQUENCE OF RelativeDistinguishedName
+--- a/crypto/asymmetric_keys/pkcs7_parser.c
++++ b/crypto/asymmetric_keys/pkcs7_parser.c
+@@ -269,6 +269,13 @@
+ 	struct pkcs7_parse_context *ctx = context;
+ 
+ 	switch (ctx->last_oid) {
++	case OID_id_ecdsa_with_sha1:
++	case OID_id_ecdsa_with_sha224:
++	case OID_id_ecdsa_with_sha256:
++	case OID_id_ecdsa_with_sha384:
++	case OID_id_ecdsa_with_sha512:
++		ctx->sinfo->sig->pkey_algo = "ecdsa";
++		break;
+ 	case OID_rsaEncryption:
+ 		ctx->sinfo->sig->pkey_algo = "rsa";
+ 		break;
+--- a/crypto/asymmetric_keys/pkcs7_verify.c
++++ b/crypto/asymmetric_keys/pkcs7_verify.c
+@@ -147,7 +147,9 @@
+ 		pr_devel("Sig %u: Found cert serial match X.509[%u]\n",
+ 			 sinfo->index, certix);
+ 
+-		if (strcmp(x509->pub->pkey_algo, sinfo->sig->pkey_algo) != 0) {
++		if (strcmp(x509->pub->pkey_algo, sinfo->sig->pkey_algo) != 0 &&
++		    !(strncmp(x509->pub->pkey_algo, "ecdsa-nist-", 11) == 0 &&
++		      strcmp(sinfo->sig->pkey_algo, "ecdsa") == 0)) {
+ 			pr_warn("Sig %u: X.509 algo and PKCS#7 sig algo don't match\n",
+ 				sinfo->index);
+ 			continue;
+--- a/crypto/asymmetric_keys/x509_public_key.c
++++ b/crypto/asymmetric_keys/x509_public_key.c
+@@ -131,7 +131,9 @@
+ 	}
+ 
+ 	ret = -EKEYREJECTED;
+-	if (strcmp(cert->pub->pkey_algo, cert->sig->pkey_algo) != 0)
++	if (strcmp(cert->pub->pkey_algo, cert->sig->pkey_algo) != 0 &&
++	    !(strncmp(cert->pub->pkey_algo, "ecdsa-nist-", 11) == 0 &&
++	      strcmp(cert->sig->pkey_algo, "ecdsa") == 0))
+ 		goto out;
+ 
+ 	if (cert->unsupported_sig) {
+--- a/include/uapi/linux/fsverity.h
++++ b/include/uapi/linux/fsverity.h
+@@ -100,4 +100,27 @@
+ #define FS_IOC_READ_VERITY_METADATA \
+ 	_IOWR('f', 135, struct fsverity_read_metadata_arg)
+ 
++struct code_sign_enable_arg {
++	__u32 version;
++	__u32 hash_algorithm;
++	__u32 block_size;
++	__u32 salt_size;
++	__u64 salt_ptr;
++	__u32 sig_size;
++	__u32 __reserved1;
++	__u64 sig_ptr;
++	__u64 __reserved2[5];
++	__u32 __reserved3;
++	__u32 pgtypeinfo_size;
++	__u64 pgtypeinfo_off;
++	__u64 tree_offset;
++	__u64 root_hash_ptr;
++	__u64 data_size;
++	__u32 flags;
++	__u32 cs_version;
++};
++
++#define FS_IOC_ENABLE_CODE_SIGN _IOW('f', 200, struct code_sign_enable_arg)
++
++
+ #endif /* _UAPI_LINUX_FSVERITY_H */
+--- /dev/null
++++ b/include/linux/code_sign.h
+@@ -0,0 +1,93 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (c) 2023 Huawei Device Co., Ltd.
++ */
++
++#ifndef LINUX_INCLUDE_CODE_SIGN_H
++#define LINUX_INCLUDE_CODE_SIGN_H
++
++#include <linux/fs.h>
++
++/*
++ * Merkle tree properties.  The file measurement is the hash of this structure
++ * excluding the signature and with the sig_size field set to 0, while version
++ * is replaced by code sign version.
++ */
++struct code_sign_descriptor {
++	__u8 version;		/* must be 1 */
++	__u8 hash_algorithm;	/* Merkle tree hash algorithm */
++	__u8 log_blocksize;	/* log2 of size of data and tree blocks */
++	__u8 salt_size;		/* size of salt in bytes; 0 if none */
++	__le32 sig_size;	/* size of signature in bytes; 0 if none */
++	__le64 data_size;	/* size of file the Merkle tree is built over */
++	__u8 root_hash[64];	/* Merkle tree root hash */
++	__u8 salt[32];		/* salt prepended to each hashed block */
++	__u32 flags;
++	__u32 pgtypeinfo_size;   /* size of page type info (in number of btis) */
++	__u64 tree_offset;  /* merkle tree offset in file */
++	__u64 pgtypeinfo_off;  /* offset of page type info */
++	__u8 __reserved2[119]; /* must be 0's */
++	__u8 cs_version;    /* code sign version */
++	__u8 signature[];	/* optional PKCS#7 signature */
++};
++
++enum {
++	RELEASE_CODE_START = 0x0,
++	RELEASE_PLATFORM_CODE,
++	RELEASE_AUTHED_CODE,
++	RELEASE_DEVELOPER_CODE,
++	RELEASE_BLOCK_CODE,
++	RELEASE_CODE_END,
++
++	DEBUG_CODE_START = 0x100,
++	DEBUG_PLATFORM_CODE,
++	DEBUG_AUTHED_CODE,
++	DEBUG_DEVELOPER_CODE,
++	DEBUG_BLOCK_CODE,
++	DEBUG_DEBUG_CODE,
++	DEBUG_CODE_END,
++
++	MAY_LOCAL_CODE = 0x201,
++};
++
++#define FLAG_INSIDE_TREE	(1 << 0) /* Merkle tree in file */
++#define IS_INSIDE_TREE(desc)	((desc)->flags & FLAG_INSIDE_TREE)
++
++#define CONST_CAST_CODE_SIGN_DESC(desc) ((const struct code_sign_descriptor *)(desc))
++#define CAST_CODE_SIGN_DESC(desc) ((struct code_sign_descriptor *)(desc))
++
++static inline u64 get_tree_offset_compact(const void *desc)
++{
++	return CONST_CAST_CODE_SIGN_DESC(desc)->tree_offset;
++}
++
++static inline bool is_inside_tree_compact(const void *_desc)
++{
++	const struct code_sign_descriptor *desc = CONST_CAST_CODE_SIGN_DESC(_desc);
++
++	return desc->cs_version && IS_INSIDE_TREE(desc);
++}
++
++/* Direct validation for the built-in 4.19 adapter (no HCK framework). */
++static inline int code_sign_check_descriptor_hook(const struct inode *inode, const void *_desc)
++{
++	const struct code_sign_descriptor *d = _desc;
++	u64 size = le64_to_cpu(d->data_size), tree = le64_to_cpu(d->tree_offset);
++	u64 pgsize = le32_to_cpu(d->pgtypeinfo_size) / 8;
++	if (!d->cs_version)
++		return 0;
++	if (d->version != 1 || (d->cs_version != 1 && d->cs_version != 2) ||
++	    (le32_to_cpu(d->flags) & ~FLAG_INSIDE_TREE) ||
++	    memchr_inv(d->__reserved2, 0, sizeof(d->__reserved2)) ||
++	    d->salt_size > sizeof(d->salt) || size > inode->i_size ||
++	    pgsize > size || le64_to_cpu(d->pgtypeinfo_off) > size - pgsize)
++		return -EINVAL;
++	if (IS_INSIDE_TREE(d)) {
++		if (tree < size || tree > inode->i_size || tree % PAGE_SIZE)
++			return -EINVAL;
++	} else if (tree || size != inode->i_size) {
++		return -EINVAL;
++	}
++	return 1;
++}
++#endif /* LINUX_INCLUDE_CODE_SIGN_H */
+--- a/fs/verity/enable.c
++++ b/fs/verity/enable.c
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * Ioctl to enable verity on a file
++ * fs/verity/enable.c: ioctl to enable verity on a file
+  *
+  * Copyright 2019 Google LLC
+  */
+@@ -10,8 +10,36 @@
+ #include <crypto/hash.h>
+ #include <linux/backing-dev.h>
+ #include <linux/mount.h>
++#include <linux/pagemap.h>
+ #include <linux/sched/signal.h>
+ #include <linux/uaccess.h>
++
++static int check_file_and_enable_verity(struct file *filp,
++	const struct fsverity_enable_arg *arg);
++
++#ifdef CONFIG_FS_VERITY
++
++static int code_sign_init_descriptor(struct inode *inode,
++	const struct fsverity_enable_arg *_arg, struct fsverity_descriptor *_desc);
++
++static int code_sign_copy_merkle_tree(struct file *filp, const void *_desc,
++	const struct merkle_tree_params *params);
++
++#else /* !CONFIG_FS_VERITY */
++
++static inline int code_sign_init_descriptor(struct inode *inode,
++	const struct fsverity_enable_arg *_arg, struct fsverity_descriptor *_desc)
++{
++	return 0;
++}
++
++static int code_sign_copy_merkle_tree(struct file *filp,
++	const void *_desc,
++	const struct merkle_tree_params *params)
++{
++	return 0;
++}
++#endif /* !CONFIG_FS_VERITY */
+ 
+ /*
+  * Read a file data page for Merkle tree construction.  Do aggressive readahead,
+@@ -149,16 +177,16 @@
+  */
+ static int build_merkle_tree(struct file *filp,
+ 			     const struct merkle_tree_params *params,
+-			     u8 *root_hash)
+-{
+-	struct inode *inode = file_inode(filp);
++			     u8 *root_hash,
++			     size_t data_size)
++{
+ 	u8 *pending_hashes;
+ 	struct ahash_request *req;
+ 	u64 blocks;
+ 	unsigned int level;
+ 	int err = -ENOMEM;
+ 
+-	if (inode->i_size == 0) {
++	if (data_size == 0) {
+ 		/* Empty file is a special case; root hash is all 0's */
+ 		memset(root_hash, 0, params->digest_size);
+ 		return 0;
+@@ -176,7 +204,7 @@
+ 	 * (level 0) and ascending to the root node (level 'num_levels - 1').
+ 	 * Then at the end (level 'num_levels'), calculate the root hash.
+ 	 */
+-	blocks = (inode->i_size + params->block_size - 1) >>
++	blocks = ((u64)data_size + params->block_size - 1) >>
+ 		 params->log_blocksize;
+ 	for (level = 0; level <= params->num_levels; level++) {
+ 		err = build_merkle_tree_level(filp, level, blocks, params,
+@@ -198,11 +226,8 @@
+ 			 const struct fsverity_enable_arg *arg)
+ {
+ 	struct inode *inode = file_inode(filp);
+-	const struct fsverity_operations *vops = inode->i_sb->s_vop;
+-	struct merkle_tree_params params = { };
+ 	struct fsverity_descriptor *desc;
+ 	size_t desc_size = sizeof(*desc) + arg->sig_size;
+-	struct fsverity_info *vi;
+ 	int err;
+ 
+ 	/* Start initializing the fsverity_descriptor */
+@@ -233,11 +258,42 @@
+ 
+ 	desc->data_size = cpu_to_le64(inode->i_size);
+ 
++	err = code_sign_init_descriptor(inode, arg, desc);
++	if (err) {
++		fsverity_err(inode, "Init code sign descriptor err: %u", err);
++		goto out;
++	}
++
++	err = code_sign_check_descriptor_hook(inode, desc);
++	if (err < 0)
++		goto out;
++	err = fsverity_enable_with_descriptor(filp, (void *)desc, desc_size);
++out:
++	kfree(desc);
++	return err;
++}
++
++int fsverity_enable_with_descriptor(struct file *filp,
++	void *_desc, size_t desc_size)
++{
++	struct inode *inode = file_inode(filp);
++	const struct fsverity_operations *vops = inode->i_sb->s_vop;
++	struct merkle_tree_params params = { };
++	struct fsverity_descriptor *desc = (struct fsverity_descriptor *)_desc;
++	struct fsverity_info *vi;
++	int err;
++
++	if (vops == NULL) {
++		fsverity_err(inode, "current filesystem doesn't support fs-verity.");
++		return -ENOTTY;
++	}
++
+ 	/* Prepare the Merkle tree parameters */
+ 	err = fsverity_init_merkle_tree_params(&params, inode,
+-					       arg->hash_algorithm,
++					       desc->hash_algorithm,
+ 					       desc->log_blocksize,
+-					       desc->salt, desc->salt_size);
++					       desc->salt, desc->salt_size,
++					       desc->data_size);
+ 	if (err)
+ 		goto out;
+ 
+@@ -254,6 +310,13 @@
+ 	if (err)
+ 		goto out;
+ 
++	err = code_sign_copy_merkle_tree(filp, _desc, &params);
++	if (err < 0) {
++		fsverity_err(inode, "Error %d copying Merkle tree", err);
++		goto rollback;
++	} else if (err == 1) /* already copy merkle tree */
++		goto skip_build;
++
+ 	/*
+ 	 * Build the Merkle tree.  Don't hold the inode lock during this, since
+ 	 * on huge files this may take a very long time and we don't want to
+@@ -265,11 +328,13 @@
+ 	 */
+ 	pr_debug("Building Merkle tree...\n");
+ 	BUILD_BUG_ON(sizeof(desc->root_hash) < FS_VERITY_MAX_DIGEST_SIZE);
+-	err = build_merkle_tree(filp, &params, desc->root_hash);
++	err = build_merkle_tree(filp, &params, desc->root_hash, desc->data_size);
+ 	if (err) {
+ 		fsverity_err(inode, "Error %d building Merkle tree", err);
+ 		goto rollback;
+ 	}
++
++skip_build:
+ 	pr_debug("Done building Merkle tree.  Root hash is %s:%*phN\n",
+ 		 params.hash_alg->name, params.digest_size, desc->root_hash);
+ 
+@@ -286,9 +351,9 @@
+ 		goto rollback;
+ 	}
+ 
+-	if (arg->sig_size)
++	if (desc->sig_size)
+ 		pr_debug("Storing a %u-byte PKCS#7 signature alongside the file\n",
+-			 arg->sig_size);
++			 desc->sig_size);
+ 
+ 	/*
+ 	 * Tell the filesystem to finish enabling verity on the file.
+@@ -316,7 +381,6 @@
+ 	}
+ out:
+ 	kfree(params.hashstate);
+-	kfree(desc);
+ 	return err;
+ 
+ rollback:
+@@ -325,6 +389,7 @@
+ 	inode_unlock(inode);
+ 	goto out;
+ }
++EXPORT_SYMBOL_GPL(fsverity_enable_with_descriptor);
+ 
+ /**
+  * fsverity_ioctl_enable() - enable verity on a file
+@@ -338,9 +403,7 @@
+  */
+ int fsverity_ioctl_enable(struct file *filp, const void __user *uarg)
+ {
+-	struct inode *inode = file_inode(filp);
+ 	struct fsverity_enable_arg arg;
+-	int err;
+ 
+ 	if (copy_from_user(&arg, uarg, sizeof(arg)))
+ 		return -EFAULT;
+@@ -361,6 +424,15 @@
+ 	if (arg.sig_size > FS_VERITY_MAX_SIGNATURE_SIZE)
+ 		return -EMSGSIZE;
+ 
++	return check_file_and_enable_verity(filp, &arg);
++}
++EXPORT_SYMBOL_GPL(fsverity_ioctl_enable);
++
++static int check_file_and_enable_verity(struct file *filp,
++	const struct fsverity_enable_arg *arg)
++{
++	struct inode *inode = file_inode(filp);
++	int err;
+ 	/*
+ 	 * Require a regular file with write access.  But the actual fd must
+ 	 * still be readonly so that we can lock out all writers.  This is
+@@ -389,7 +461,7 @@
+ 	if (err) /* -ETXTBSY */
+ 		goto out_drop_write;
+ 
+-	err = enable_verity(filp, &arg);
++	err = enable_verity(filp, arg);
+ 
+ 	/*
+ 	 * We no longer drop the inode's pagecache after enabling verity.  This
+@@ -416,4 +488,155 @@
+ 	mnt_drop_write_file(filp);
+ 	return err;
+ }
+-EXPORT_SYMBOL_GPL(fsverity_ioctl_enable);
++
++#ifdef CONFIG_FS_VERITY
++static int code_sign_copy_merkle_tree(struct file *filp,
++				 const void *_desc,
++				 const struct merkle_tree_params *params)
++{
++	struct inode *inode = file_inode(filp);
++	const struct fsverity_operations *vops = inode->i_sb->s_vop;
++	u8 *tree_data;
++	u64 blocks, i;
++	int err = -ENOMEM;
++	struct file_ra_state ra = { 0 };
++	struct page *src_page;
++	void *addr;
++	u64 tree_offset, tree_start_index;
++
++	if (!is_inside_tree_compact(_desc))
++		return 0;
++
++	tree_offset = get_tree_offset_compact(_desc);
++
++	if (tree_offset > inode->i_size || params->tree_size > inode->i_size - tree_offset) {
++		fsverity_err(inode, "File is too small to contain Merkle tree.");
++		return -EFAULT;
++	}
++
++	tree_data = kmalloc(PAGE_SIZE, GFP_KERNEL);
++	if (!tree_data)
++		goto out;
++
++	file_ra_state_init(&ra, filp->f_mapping);
++
++	tree_start_index = tree_offset >> PAGE_SHIFT;
++	blocks = params->tree_size >> PAGE_SHIFT;
++	for (i = 0; i < blocks; i++) {
++		pr_debug("Copy Merkle tree page at %llu\n", tree_start_index + i);
++		src_page = read_file_data_page(filp, tree_start_index + i, &ra,
++							blocks - i);
++		if (IS_ERR(src_page)) {
++			err = PTR_ERR(src_page);
++			fsverity_err(inode,
++						"Error %d reading Merkle tree page %llu",
++						err, tree_start_index + i);
++			goto out;
++		}
++
++		addr = kmap_atomic(src_page);
++		memcpy(tree_data, addr, PAGE_SIZE);
++		kunmap_atomic(addr);
++		put_page(src_page);
++		err = vops->write_merkle_tree_block(inode, tree_data, i,
++				params->log_blocksize);
++		if (err) {
++			fsverity_err(inode,
++					"Error %d writing Merkle tree block %llu",
++					err, i);
++			goto out;
++		}
++	}
++	/* already copy merkle tree */
++	err = 1;
++out:
++	kfree(tree_data);
++	return err;
++}
++
++static int code_sign_init_descriptor(struct inode *inode,
++	const struct fsverity_enable_arg *_arg,
++	struct fsverity_descriptor *_desc)
++{
++	struct code_sign_descriptor *desc = CAST_CODE_SIGN_DESC(_desc);
++	const struct code_sign_enable_arg *arg = (const struct code_sign_enable_arg *)_arg;
++	struct fsverity_hash_alg *alg;
++
++	if (!arg->cs_version)
++		return 0;
++
++	/* init extended fields */
++	desc->flags = cpu_to_le32(arg->flags);
++	desc->data_size = cpu_to_le64(arg->data_size);
++	desc->tree_offset = cpu_to_le64(arg->tree_offset);
++	desc->cs_version = arg->cs_version;
++	desc->pgtypeinfo_size = cpu_to_le32(arg->pgtypeinfo_size);
++	desc->pgtypeinfo_off = cpu_to_le64(arg->pgtypeinfo_off);
++
++	/* Get root hash if a Merkle tree carried in file */
++	if (!IS_INSIDE_TREE(desc))
++		return 0;
++
++	/* Get size of root hash */
++	alg = fsverity_get_hash_alg(inode, desc->hash_algorithm);
++	if (IS_ERR(alg))
++		return PTR_ERR(alg);
++
++	if (copy_from_user(desc->root_hash, u64_to_user_ptr(arg->root_hash_ptr),
++			alg->digest_size)) {
++		return -EFAULT;
++	}
++
++	return 0;
++}
++
++/**
++ * fsverity_ioctl_enable_code_sign() - enable code signing on a file
++ * @filp: file to enable code signing on
++ * @uarg: user pointer to code_sign_enable_arg
++ *
++ * Enable fs-verity on a file with code signing features.
++ *
++ * Return: 0 on success, -errno on failure
++ */
++int fsverity_ioctl_enable_code_sign(struct file *filp, const void __user *uarg)
++{
++	struct inode *inode = file_inode(filp);
++	struct code_sign_enable_arg arg;
++
++	if (copy_from_user(&arg, uarg, sizeof(arg)))
++		return -EFAULT;
++
++	if (arg.version != 1)
++		return -EINVAL;
++
++	if (arg.__reserved1 ||
++	    memchr_inv(arg.__reserved2, 0, sizeof(arg.__reserved2)))
++		return -EINVAL;
++
++	if ((arg.cs_version != 1 && arg.cs_version != 2) || arg.__reserved3 ||
++	    (arg.flags & ~FLAG_INSIDE_TREE) || arg.data_size > inode->i_size)
++		return -EINVAL;
++
++	if (arg.tree_offset % PAGE_SIZE != 0)
++		return -EINVAL;
++
++	if (arg.block_size != PAGE_SIZE)
++		return -EINVAL;
++
++	if (arg.salt_size > sizeof_field(struct code_sign_descriptor, salt))
++		return -EMSGSIZE;
++
++	if (arg.sig_size > FS_VERITY_MAX_SIGNATURE_SIZE)
++		return -EMSGSIZE;
++
++	// when calc pgtypeinfo_size trans bit size to byte size
++	if (arg.pgtypeinfo_size / 8 > arg.data_size ||
++	    arg.pgtypeinfo_off > arg.data_size - arg.pgtypeinfo_size / 8)
++		return -EINVAL;
++
++	return check_file_and_enable_verity(filp, (struct fsverity_enable_arg *)&arg);
++}
++EXPORT_SYMBOL_GPL(fsverity_ioctl_enable_code_sign);
++#endif /* CONFIG_FS_VERITY */
++
+--- a/fs/verity/fsverity_private.h
++++ b/fs/verity/fsverity_private.h
+@@ -16,6 +16,7 @@
+ 
+ #include <crypto/sha.h>
+ #include <linux/fsverity.h>
++#include <linux/code_sign.h>
+ #include <linux/mempool.h>
+ 
+ struct ahash_request;
+@@ -75,6 +76,7 @@
+ 	u8 root_hash[FS_VERITY_MAX_DIGEST_SIZE];
+ 	u8 file_digest[FS_VERITY_MAX_DIGEST_SIZE];
+ 	const struct inode *inode;
++	u64 verified_data_size;
+ };
+ 
+ /* Arbitrary limit to bound the kmalloc() size.  Can be changed. */
+@@ -82,6 +84,8 @@
+ 
+ #define FS_VERITY_MAX_SIGNATURE_SIZE	(FS_VERITY_MAX_DESCRIPTOR_SIZE - \
+ 					 sizeof(struct fsverity_descriptor))
++
++int fsverity_enable_with_descriptor(struct file *filp, void *desc, size_t desc_size);
+ 
+ /* hash_algs.c */
+ 
+@@ -119,7 +123,7 @@
+ 				     const struct inode *inode,
+ 				     unsigned int hash_algorithm,
+ 				     unsigned int log_blocksize,
+-				     const u8 *salt, size_t salt_size);
++				     const u8 *salt, size_t salt_size, u64 data_size);
+ 
+ struct fsverity_info *fsverity_create_info(const struct inode *inode,
+ 					   struct fsverity_descriptor *desc,
+--- a/fs/verity/open.c
++++ b/fs/verity/open.c
+@@ -29,7 +29,7 @@
+ 				     const struct inode *inode,
+ 				     unsigned int hash_algorithm,
+ 				     unsigned int log_blocksize,
+-				     const u8 *salt, size_t salt_size)
++				     const u8 *salt, size_t salt_size, u64 data_size)
+ {
+ 	struct fsverity_hash_alg *hash_alg;
+ 	int err;
+@@ -89,8 +89,8 @@
+ 	 */
+ 
+ 	/* Compute number of levels and the number of blocks in each level */
+-	blocks = (inode->i_size + params->block_size - 1) >> log_blocksize;
+-	pr_debug("Data is %lld bytes (%llu blocks)\n", inode->i_size, blocks);
++	blocks = (data_size + params->block_size - 1) >> log_blocksize;
++	pr_debug("Data is %lld bytes (%llu blocks)\n", data_size, blocks);
+ 	while (blocks > 1) {
+ 		if (params->num_levels >= FS_VERITY_MAX_LEVELS) {
+ 			fsverity_err(inode, "Too many levels in Merkle tree");
+@@ -132,11 +132,16 @@
+ 			       u8 *file_digest)
+ {
+ 	__le32 sig_size = desc->sig_size;
++	struct code_sign_descriptor *cs = (struct code_sign_descriptor *)desc;
++	u8 cs_version = cs->cs_version;
+ 	int err;
+ 
++	if (cs_version == 1)
++		cs->cs_version = 0;
+ 	desc->sig_size = 0;
+ 	err = fsverity_hash_buffer(hash_alg, desc, sizeof(*desc), file_digest);
+ 	desc->sig_size = sig_size;
++	cs->cs_version = cs_version;
+ 
+ 	return err;
+ }
+@@ -157,11 +162,12 @@
+ 	if (!vi)
+ 		return ERR_PTR(-ENOMEM);
+ 	vi->inode = inode;
++	vi->verified_data_size = le64_to_cpu(desc->data_size);
+ 
+ 	err = fsverity_init_merkle_tree_params(&vi->tree_params, inode,
+ 					       desc->hash_algorithm,
+ 					       desc->log_blocksize,
+-					       desc->salt, desc->salt_size);
++					       desc->salt, desc->salt_size, le64_to_cpu(desc->data_size));
+ 	if (err) {
+ 		fsverity_err(inode,
+ 			     "Error %d initializing Merkle tree parameters",
+@@ -234,6 +240,12 @@
+ 		return false;
+ 	}
+ 
++	if (((const struct code_sign_descriptor *)desc)->cs_version) {
++		if (le32_to_cpu(desc->sig_size) > desc_size - sizeof(*desc))
++			return false;
++		return code_sign_check_descriptor_hook(inode, desc) == 1;
++	}
++
+ 	if (memchr_inv(desc->__reserved, 0, sizeof(desc->__reserved))) {
+ 		fsverity_err(inode, "Reserved bits set in descriptor");
+ 		return false;
+--- a/fs/verity/verify.c
++++ b/fs/verity/verify.c
+@@ -102,6 +102,9 @@
+ 		return false;
+ 
+ 	pr_debug_ratelimited("Verifying data page %lu...\n", index);
++	/* HAP trailers are outside the signed data region, as in upstream H6. */
++	if (index >= DIV_ROUND_UP(vi->verified_data_size, PAGE_SIZE))
++		return true;
+ 
+ 	/*
+ 	 * Starting at the leaf level, ascend the tree saving hash pages along
+--- a/include/linux/fsverity.h
++++ b/include/linux/fsverity.h
+@@ -127,6 +127,7 @@
+ /* enable.c */
+ 
+ int fsverity_ioctl_enable(struct file *filp, const void __user *arg);
++int fsverity_ioctl_enable_code_sign(struct file *filp, const void __user *arg);
+ 
+ /* measure.c */
+ 
+@@ -156,6 +157,11 @@
+ }
+ 
+ /* enable.c */
++
++static inline int fsverity_ioctl_enable_code_sign(struct file *filp, const void __user *arg)
++{
++	return -EOPNOTSUPP;
++}
+ 
+ static inline int fsverity_ioctl_enable(struct file *filp,
+ 					const void __user *arg)
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -1237,6 +1237,11 @@
+ 	}
+ 	case EXT4_IOC_SHUTDOWN:
+ 		return ext4_shutdown(sb, arg);
++
++	case FS_IOC_ENABLE_CODE_SIGN:
++		if (!ext4_has_feature_verity(sb))
++			return -EOPNOTSUPP;
++		return fsverity_ioctl_enable_code_sign(filp, (const void __user *)arg);
+ 
+ 	case FS_IOC_ENABLE_VERITY:
+ 		if (!ext4_has_feature_verity(sb))
+@@ -1322,6 +1327,7 @@
+ 	case FS_IOC_GET_ENCRYPTION_NONCE:
+ 	case EXT4_IOC_SHUTDOWN:
+ 	case FS_IOC_GETFSMAP:
++	case FS_IOC_ENABLE_CODE_SIGN:
+ 	case FS_IOC_ENABLE_VERITY:
+ 	case FS_IOC_MEASURE_VERITY:
+ 	case EXT4_IOC_FSGETXATTR:
