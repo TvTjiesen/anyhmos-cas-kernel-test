@@ -115,8 +115,21 @@ log "=== 4b. enable the SDE/MDSS display stack ==="
 scripts/config --file out/.config \
   -e DRM -e DRM_KMS_HELPER -e DRM_PANEL \
   -e DRM_MSM -e DRM_MSM_SDE -e DRM_MSM_DSI -e DRM_MSM_DP \
-  -e QCOM_MDSS_PLL -e MSM_SDE_ROTATOR \
-  -e DRM_FBDEV_EMULATION 2>&1 | tail -20
+  -e QCOM_MDSS_PLL -e MSM_SDE_ROTATOR 2>&1 | tail -20
+
+log "=== 4b2. keep legacy fbdev/fbcon OUT of the image ==="
+# Round 6 booted to 3.18 s and then went silent for 28 s before preinit even
+# reached its first line, then the board reset -- while run 9 (same kernel
+# source, same patches) had PID1 up at 5.8 s. The only config delta between
+# those two kernels is display: DRM_MSM, DRM_FBDEV_EMULATION and FB.
+# CONFIG_FB=y drags in the whole ancient fbdev stack (FB_MSM, FB_SIMPLE,
+# FB_VIRTUAL, LOGO, fbcon), and fbcon then tries to draw on a framebuffer that
+# the SDE driver has not brought up yet. Android kernels never set CONFIG_FB;
+# HarmonyOS' composer talks to /dev/dri/card0 through DRM atomic ioctls and has
+# no use for fbdev. So: DRM only, no FB, no fbdev emulation, no logo.
+scripts/config --file out/.config \
+  -d FB -d DRM_FBDEV_EMULATION -d DRM_FBDEV_LEAK_PHYS_SMEM \
+  -d LOGO -d FB_MSM -d FB_SIMPLE -d FB_VIRTUAL -d FB_KMS_HELPER 2>&1 | tail -20
 
 log "=== 4c. drop the in-tree legacy msm driver (kona uses techpack SDE) ==="
 # Enabling CONFIG_DRM_MSM also pulls in drivers/gpu/drm/msm, the *old*
@@ -142,6 +155,7 @@ make O=out ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig 2>&1 | tail -15
 log "--- display config after olddefconfig ---"
 grep -E 'CONFIG_(DRM|DRM_MSM|DRM_MSM_SDE|DRM_MSM_DSI|DRM_MSM_DP|QCOM_MDSS_PLL|MSM_SDE_ROTATOR|DRM_FBDEV_EMULATION|DRM_PANEL)=' out/.config >> "$REPORT" || true
 grep -E '^# CONFIG_DRM_MSM is not set' out/.config >> "$REPORT" || log "DRM_MSM is enabled"
+grep -E '^CONFIG_FB=|^# CONFIG_FB is not set|^CONFIG_DRM_FBDEV_EMULATION=|^# CONFIG_DRM_FBDEV_EMULATION is not set' out/.config >> "$REPORT" || true
 log "--- key config values ---"
 grep -E 'CONFIG_(ARCH_QCOM|COMPAT|ACCESS_TOKENID|BINDER_SENDER_INFO|FS_VERITY|EROFS_FS|ANDROID_BINDERFS|QCOM_KGSL|CRYPTO_ECDSA|CRYPTO_ECC|BLK_DEV_LOOP)=' out/.config >> "$REPORT" || true
 # USB gadget serial console: this is how the 6.7 s -> reset window becomes visible.
