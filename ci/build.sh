@@ -118,6 +118,26 @@ scripts/config --file out/.config \
   -e QCOM_MDSS_PLL -e MSM_SDE_ROTATOR \
   -e DRM_FBDEV_EMULATION 2>&1 | tail -20
 
+log "=== 4c. drop the in-tree legacy msm driver (kona uses techpack SDE) ==="
+# Enabling CONFIG_DRM_MSM also pulls in drivers/gpu/drm/msm, the *old*
+# DPU1/MDP4/MDP5 HDMI/eDP driver. It is not what kona's mdss node binds to
+# (cas' DT uses qcom,sde-kms, provided by techpack/display), and with gcc-12 it
+# dies on msm_drv.c:1237 "control reaches end of non-void function
+# [-Werror=return-type]" -- that is what failed run 15. LineageOS builds with
+# clang (TARGET_KERNEL_NO_GCC), so they never see it. Empty the obj- rule:
+# msm-y then has no consumer and none of those objects are compiled.
+python3 - <<'PY' || { log "FATAL could not disable legacy drm/msm"; exit 3; }
+p = 'drivers/gpu/drm/msm/Makefile'
+s = open(p, encoding='utf-8').read()
+old = 'obj-$(CONFIG_DRM_MSM)\t+= msm.o\n'
+new = '# obj-$(CONFIG_DRM_MSM)\t+= msm.o  # legacy DPU1/MDP driver, not for kona\n'
+if old not in s:
+    print('[build] legacy obj rule not found, left unchanged')
+    raise SystemExit(1)
+open(p, 'w', encoding='utf-8', newline='').write(s.replace(old, new, 1))
+print('[build] legacy drm/msm objects disabled')
+PY
+
 make O=out ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig 2>&1 | tail -15
 log "--- display config after olddefconfig ---"
 grep -E 'CONFIG_(DRM|DRM_MSM|DRM_MSM_SDE|DRM_MSM_DSI|DRM_MSM_DP|QCOM_MDSS_PLL|MSM_SDE_ROTATOR|DRM_FBDEV_EMULATION|DRM_PANEL)=' out/.config >> "$REPORT" || true
@@ -135,7 +155,7 @@ grep -E 'CONFIG_(ARCH_QCOM|COMPAT|ACCESS_TOKENID|BINDER_SENDER_INFO|FS_VERITY|ER
 
 log "=== 5. build Image.gz-dtb ==="
 make -j"$(nproc)" O=out ARCH=arm64 CROSS_COMPILE="$CROSS" \
-  KCFLAGS="-Wno-error -Wno-attribute-alias" Image.gz-dtb 2>&1 | tee "$ROOT/build.log"
+  KCFLAGS="-Wno-error -Wno-error=return-type -Wno-error=maybe-uninitialized -Wno-error=implicit-fallthrough -Wno-error=array-bounds -Wno-error=stringop-overflow -Wno-error=unused-but-set-variable -Wno-attribute-alias" Image.gz-dtb 2>&1 | tee "$ROOT/build.log"
 RC=${PIPESTATUS[0]}
 log "build rc=$RC"
 log "display objects: techpack/msm=$(ls out/techpack/display/msm/*.o 2>/dev/null | wc -l) drm/msm=$(ls out/drivers/gpu/drm/msm/*.o 2>/dev/null | wc -l)"
@@ -162,7 +182,7 @@ make O=out ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig 2>&1 | tail -10
 log "gatekeeper PSTORE_CONSOLE = $(grep -E '^CONFIG_PSTORE_CONSOLE=' out/.config || echo 'not set')"
 cp out/.config "$ART/kernel-gatekeeper.config"
 make -j"$(nproc)" O=out ARCH=arm64 CROSS_COMPILE="$CROSS" \
-  KCFLAGS="-Wno-error -Wno-attribute-alias" Image 2>&1 | tee "$ROOT/build-gate.log"
+  KCFLAGS="-Wno-error -Wno-error=return-type -Wno-error=maybe-uninitialized -Wno-error=implicit-fallthrough -Wno-error=array-bounds -Wno-error=stringop-overflow -Wno-error=unused-but-set-variable -Wno-attribute-alias" Image 2>&1 | tee "$ROOT/build-gate.log"
 GRC=${PIPESTATUS[0]}
 log "gatekeeper build rc=$GRC"
 if [ -f out/arch/arm64/boot/Image ]; then
