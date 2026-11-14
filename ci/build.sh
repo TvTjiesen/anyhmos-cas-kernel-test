@@ -82,23 +82,11 @@ log "=== 3c. bake a USB serial console into the kernel command line ==="
 # rejected by gs_console_connect() ("port num [N] is not support console") and
 # not one byte reaches the cable. The boot image header is deliberately NOT
 # touched -- editing its cmdline made the cas bootloader answer "Load Error"
-# twice -- the token is appended to the DT bootargs inside
-# early_init_dt_scan_chosen() instead, so only the kernel binary changes.
-python3 - <<'PY'
-p = 'drivers/of/fdt.c'
-s = open(p, encoding='utf-8', errors='replace').read()
-old = 'strlcpy(data, p, min((int)l, COMMAND_LINE_SIZE));'
-add = 'strlcat(data, " console=ttyGS0,115200 ignore_loglevel", COMMAND_LINE_SIZE);'
-if 'console=ttyGS0' in s:
-    print('[build] console token already present')
-elif old in s:
-    s = s.replace(old, old + '\n\t\t' + add, 1)
-    open(p, 'w', encoding='utf-8', newline='').write(s)
-    print('[build] console=ttyGS0 appended to DT bootargs')
-else:
-    print('[build] WARN fdt.c pattern not found -- console token NOT added')
-PY
-grep -n "console=ttyGS0" drivers/of/fdt.c | tee -a "$REPORT" || log "WARN no console token in fdt.c"
+# twice -- so the token rides in the built-in cmdline instead.
+# CONFIG_CMDLINE_EXTEND=y is already set in kona-perf_defconfig, so the built-in
+# CONFIG_CMDLINE is appended to the bootloader cmdline by arm64 setup_arch. That
+# is the config-only way to add a console token: no boot image header edit, no
+# source pattern to miss. The token is added in the scripts/config stage below.
 
 log "=== 4. configure: base defconfig -> fragments -> scripts/config ==="
 make O=out ARCH=arm64 CROSS_COMPILE="$CROSS" vendor/kona-perf_defconfig 2>&1 | tail -15
@@ -116,12 +104,16 @@ scripts/config --file out/.config \
   -e PKCS7_MESSAGE_PARSER -e X509_CERTIFICATE_PARSER \
   -e EROFS_FS -e EROFS_FS_XATTR -e EROFS_FS_SECURITY \
   -e BLK_DEV_LOOP -e PID_NS -e USER_NS -e FAIR_GROUP_SCHED \
-  -e QCOM_KGSL   -e U_SERIAL_CONSOLE -e USB_G_SERIAL -e USB_ACM -e USB_CONFIGFS_ACM 2>&1 | tail -20
+  -e QCOM_KGSL   -e U_SERIAL_CONSOLE -e USB_G_SERIAL -e USB_ACM -e USB_CONFIGFS_ACM   --set-str CMDLINE "cgroup_disable=pressure ramoops_memreserve=4M console=ttyGS0,115200 ignore_loglevel" 2>&1 | tail -20
 make O=out ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig 2>&1 | tail -15
 log "--- key config values ---"
 grep -E 'CONFIG_(ARCH_QCOM|COMPAT|ACCESS_TOKENID|BINDER_SENDER_INFO|FS_VERITY|EROFS_FS|ANDROID_BINDERFS|QCOM_KGSL|CRYPTO_ECDSA|CRYPTO_ECC|BLK_DEV_LOOP)=' out/.config >> "$REPORT" || true
 # USB gadget serial console: this is how the 6.7 s -> reset window becomes visible.
 grep -E 'CONFIG_(U_SERIAL_CONSOLE|USB_G_SERIAL|USB_ACM|USB_CONFIGFS_ACM|USB_CONFIGFS)=' out/.config >> "$REPORT" || true
+# The console token must survive olddefconfig; if it does not, the whole USB
+# console channel is dead and every run is blind again.
+{ grep -q 'console=ttyGS0' out/.config && log "CMDLINE token present: $(grep '^CONFIG_CMDLINE=' out/.config)"; } || log "WARN console=ttyGS0 MISSING from CONFIG_CMDLINE"
+log "CMDLINE_EXTEND: $(grep '^CONFIG_CMDLINE_EXTEND=' out/.config)" 
 grep -E 'CONFIG_(ARCH_QCOM|COMPAT|ACCESS_TOKENID|BINDER_SENDER_INFO|FS_VERITY|EROFS_FS|QCOM_KGSL|CRYPTO_ECDSA)=' out/.config || true
 
 log "=== 5. build Image.gz-dtb ==="
