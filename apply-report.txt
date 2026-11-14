@@ -1,0 +1,213 @@
+[build] === 1. fetch kernel tree (lineage-23.2, matches cas-ci patches) ===
+[build] kernel HEAD = 71b13e62f057a649b77fe4062feb73ee72ad609c
+# SPDX-License-Identifier: GPL-2.0
+VERSION = 4
+PATCHLEVEL = 19
+SUBLEVEL = 325
+EXTRAVERSION =
+NAME = "People's Front"
+[build] === 2. provide missing scripts/min-tool-version.sh ===
+[build] helper written
+[build] === 3. apply patches (cas-adapted where available) ===
+patching file drivers/Kconfig
+Hunk #1 succeeded at 199 (offset -2 lines).
+patching file drivers/Makefile
+Hunk #1 succeeded at 183 (offset 2 lines).
+patching file drivers/accesstokenid/Kconfig
+patching file drivers/accesstokenid/Makefile
+patching file drivers/accesstokenid/access_tokenid.c
+patching file drivers/accesstokenid/access_tokenid.h
+patching file drivers/android/Kconfig
+patching file drivers/android/binder.c
+Hunk #1 succeeded at 622 (offset 7 lines).
+Hunk #2 succeeded at 669 (offset 7 lines).
+Hunk #3 succeeded at 3348 (offset -76 lines).
+Hunk #4 succeeded at 4628 (offset -75 lines).
+Hunk #5 succeeded at 4696 (offset -71 lines).
+Hunk #6 succeeded at 5347 (offset -69 lines).
+patching file include/linux/sched.h
+Hunk #1 succeeded at 1534 (offset 157 lines).
+patching file include/uapi/linux/android/binder.h
+patching file kernel/fork.c
+Hunk #1 succeeded at 884 (offset 300 lines).
+[build] PATCH OK      0001-access-token-binder-reference.patch
+patching file drivers/accesstokenid/access_tokenid.c
+[build] PATCH OK      0002-access-token-c89.patch
+patching file drivers/dma-buf/dma-buf.c
+Reversed (or previously applied) patch detected!  Skipping patch.
+1 out of 1 hunk ignored -- saving rejects to file drivers/dma-buf/dma-buf.c.rej
+[build] PATCH PARTIAL 0003-dma-buf-name-double-lock.patch (see .rej entries below)
+patching file drivers/gpu/drm/drm_ioctl.c
+[build] PATCH OK      0004-drm-native-display-master.patch
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/ecc.c
+Hunk #13 FAILED at 363.
+Hunk #14 FAILED at 411.
+Hunk #15 succeeded at 411 (offset -10 lines).
+Hunk #16 FAILED at 471.
+Hunk #17 succeeded at 505 (offset -9 lines).
+Hunk #18 succeeded at 778 (offset -9 lines).
+Hunk #19 succeeded at 927 (offset -9 lines).
+Hunk #20 succeeded at 976 (offset -9 lines).
+Hunk #21 succeeded at 1049 (offset -9 lines).
+Hunk #22 succeeded at 1061 (offset -9 lines).
+Hunk #23 succeeded at 1095 (offset -9 lines).
+Hunk #24 succeeded at 1112 (offset -9 lines).
+Hunk #25 succeeded at 1120 (offset -9 lines).
+Hunk #26 succeeded at 1130 (offset -9 lines).
+Hunk #27 succeeded at 1156 (offset -9 lines).
+Hunk #28 succeeded at 1195 (offset -9 lines).
+Hunk #29 succeeded at 1210 (offset -9 lines).
+Hunk #30 succeeded at 1236 (offset -9 lines).
+Hunk #31 succeeded at 1288 (offset -9 lines).
+Hunk #32 succeeded at 1438 (offset -9 lines).
+Hunk #33 succeeded at 1491 (offset -9 lines).
+Hunk #34 succeeded at 1515 (offset -9 lines).
+Hunk #35 succeeded at 1530 (offset -9 lines).
+Hunk #36 succeeded at 1552 (offset -9 lines).
+Hunk #37 succeeded at 1635 (offset -9 lines).
+3 out of 37 hunks FAILED -- saving rejects to file crypto/ecc.c.rej
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/ecc.h
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/ecc_curve_defs.h
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/ecdsa.c
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/ecdsasignature.asn1
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file include/crypto/ecdh.h
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/Makefile
+Hunk #1 succeeded at 147 (offset -19 lines).
+Hunk #2 succeeded at 162 (offset -19 lines).
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/Kconfig
+Hunk #1 succeeded at 130 (offset 2 lines).
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/asymmetric_keys/public_key.c
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file include/linux/oid_registry.h
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/asymmetric_keys/x509_cert_parser.c
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/asymmetric_keys/x509.asn1
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/asymmetric_keys/pkcs7_parser.c
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/asymmetric_keys/pkcs7_verify.c
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file crypto/asymmetric_keys/x509_public_key.c
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file include/uapi/linux/fsverity.h
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file include/linux/code_sign.h
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file fs/verity/enable.c
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file fs/verity/fsverity_private.h
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file fs/verity/open.c
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file fs/verity/verify.c
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file include/linux/fsverity.h
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file fs/ext4/ioctl.c
+Hunk #1 succeeded at 1231 (offset -6 lines).
+Hunk #2 succeeded at 1321 (offset -6 lines).
+[build] PATCH PARTIAL 0005-codesign-ecdsa-backport.patch (see .rej entries below)
+patching file techpack/display/msm/msm_gem.c
+[build] PATCH OK      0006-msm-gem-flush-new-pages.patch
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file fs/proc/Makefile
+Hunk #1 succeeded at 34 with fuzz 3 (offset -2 lines).
+(Stripping trailing CRs from patch; use --binary to disable.)
+patching file fs/proc/h6_dsmm.c
+[build] PATCH OK      0007-proc-dsmm-developer.patch
+./drivers/dma-buf/dma-buf.c.rej
+./crypto/ecc.c.rej
+[build] total .rej files: 2
+ M crypto/Kconfig
+ M crypto/Makefile
+ M crypto/asymmetric_keys/pkcs7_parser.c
+ M crypto/asymmetric_keys/pkcs7_verify.c
+ M crypto/asymmetric_keys/public_key.c
+ M crypto/asymmetric_keys/x509.asn1
+ M crypto/asymmetric_keys/x509_cert_parser.c
+ M crypto/asymmetric_keys/x509_public_key.c
+ M crypto/ecc.c
+ M crypto/ecc.h
+ M crypto/ecc_curve_defs.h
+ M drivers/Kconfig
+ M drivers/Makefile
+ M drivers/android/Kconfig
+ M drivers/android/binder.c
+ M drivers/gpu/drm/drm_ioctl.c
+ M fs/ext4/ioctl.c
+ M fs/proc/Makefile
+ M fs/verity/enable.c
+ M fs/verity/fsverity_private.h
+ M fs/verity/open.c
+ M fs/verity/verify.c
+ M include/crypto/ecdh.h
+ M include/linux/fsverity.h
+ M include/linux/oid_registry.h
+ M include/linux/sched.h
+ M include/uapi/linux/android/binder.h
+ M include/uapi/linux/fsverity.h
+ M kernel/fork.c
+ M techpack/display/msm/msm_gem.c
+?? crypto/ecc.c.rej
+?? crypto/ecdsa.c
+?? crypto/ecdsasignature.asn1
+?? drivers/accesstokenid/
+?? drivers/dma-buf/dma-buf.c.rej
+?? fs/proc/h6_dsmm.c
+?? include/linux/code_sign.h
+?? scripts/min-tool-version.sh
+[build] === 3b. overlay the repaired crypto/ecc.c ===
+[build] ecc.c overlay: 1658 lines, 4 add_128_128 refs
+[build] === 3c. bake a USB serial console into the kernel command line ===
+[build] === 4. configure: base defconfig -> fragments -> scripts/config ===
+[build] === 4b. enable the SDE/MDSS display stack ===
+[build] === 4b2. keep legacy fbdev/fbcon OUT of the image ===
+[build] === 4b3. lockup detectors (a dead spin is currently invisible) ===
+[build] === 4c. drop the in-tree legacy msm driver (kona uses techpack SDE) ===
+[build] === 4d. instrument the techpack display probe path ===
+[build] --- display config after olddefconfig ---
+CONFIG_DRM=y
+CONFIG_DRM_MSM=y
+CONFIG_DRM_MSM_DSI=y
+CONFIG_DRM_PANEL=y
+[build] DRM_MSM is enabled
+# CONFIG_DRM_FBDEV_EMULATION is not set
+# CONFIG_FB is not set
+[build] --- key config values ---
+CONFIG_ARCH_QCOM=y
+CONFIG_COMPAT=y
+CONFIG_BLK_DEV_LOOP=y
+CONFIG_BINDER_SENDER_INFO=y
+CONFIG_ACCESS_TOKENID=y
+CONFIG_QCOM_KGSL=y
+CONFIG_FS_VERITY=y
+CONFIG_EROFS_FS=y
+CONFIG_CRYPTO_ECC=y
+CONFIG_CRYPTO_ECDSA=y
+CONFIG_USB_ACM=y
+CONFIG_U_SERIAL_CONSOLE=y
+CONFIG_USB_CONFIGFS=y
+CONFIG_USB_CONFIGFS_ACM=y
+CONFIG_USB_G_SERIAL=y
+[build] CMDLINE token present: CONFIG_CMDLINE="cgroup_disable=pressure ramoops_memreserve=4M console=ttyGS0,115200 ignore_loglevel selinux=0 initcall_debug"
+[build] CMDLINE_EXTEND: CONFIG_CMDLINE_EXTEND=y
+CONFIG_SECURITY_SELINUX_BOOTPARAM=y
+CONFIG_SECURITY_SELINUX_DISABLE=y
+[build] === 5. build Image.gz-dtb ===
+[build] build rc=0
+[build] display objects: techpack/msm=20 drm/msm=0
+[build] === 6. collect experiment artifacts (BEFORE touching the config) ===
+[build] === 6b. build a GATEKEEPER kernel without a pstore console ===
+[build] gatekeeper PSTORE_CONSOLE = not set
+[build] gatekeeper build rc=0
+[build] Image-gatekeeper: 53461000 bytes
