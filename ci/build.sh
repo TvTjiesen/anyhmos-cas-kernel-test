@@ -49,33 +49,39 @@ EOF
   log "created min-tool-version shim"
 fi
 
-log "=== 3. apply HarmonyOS 6 patches ==="
+log "=== 3. apply HarmonyOS 6 patches (context tolerant) ==="
+# These patches were generated against the Samsung sm8250 tree. Their index
+# lines reference Samsung blobs that do not exist in the Xiaomi tree, so
+# `git apply --3way` can NEVER succeed here. GNU patch with fuzz tolerates
+# the remaining line-number / context drift. Failed hunks land in *.rej and
+# are reported rather than hidden.
 for p in "$PATCHES"/000*.patch; do
   n=$(basename "$p")
-  if git apply --check --whitespace=nowarn "$p" 2>/dev/null; then
-    if git apply --whitespace=nowarn "$p"; then
-      log "APPLY OK   $n"
-    else
-      log "APPLY ERR  $n (check passed but apply failed)"
-    fi
-  elif git apply --3way --whitespace=nowarn "$p" >>"$REPORT" 2>&1; then
-    log "APPLY 3WAY $n"
+  if patch -p1 --forward --batch --fuzz=3 -i "$p" >>"$REPORT" 2>&1; then
+    log "PATCH OK      $n"
   else
-    log "APPLY FAIL $n -> trying --reject for diagnostics"
-    git apply --reject --whitespace=nowarn "$p" >>"$REPORT" 2>&1 || true
-    find . -name '*.rej' -print >>"$REPORT" || true
+    log "PATCH PARTIAL $n (see .rej entries below)"
   fi
 done
-git status --short | head -80 >> "$REPORT" || true
+find . -name '*.rej' -print >> "$REPORT" || true
+log "total .rej files: $(find . -name '*.rej' | wc -l)"
+git status --short | head -120 >> "$REPORT" || true
 
-log "=== 4. merge config ==="
-make ARCH=arm64 CROSS_COMPILE="$CROSS" O=out vendor/kona_defconfig 2>&1 | tail -20
-scripts/kconfig/merge_config.sh -O out out/.config \
-  arch/arm64/configs/vendor/xiaomi/cas.config "$ROOT/ci/h6.config" 2>&1 | tail -30
-make ARCH=arm64 CROSS_COMPILE="$CROSS" O=out olddefconfig 2>&1 | tail -20
+log "=== 4. merge config (QCOM 4.19 fragment chain) ==="
+CFG=arch/arm64/configs/vendor
+mkdir -p out
+# kona_defconfig alone leaves ARCH_QCOM=n and breaks compat_uptr_t.
+# LineageOS sm8250 builds chain the perf defconfig + vendor device fragments.
+scripts/kconfig/merge_config.sh -O out \
+  "$CFG/kona-perf_defconfig" \
+  "$CFG/debugfs.config" \
+  "$CFG/xiaomi/sm8250-common.config" \
+  "$CFG/xiaomi/cas.config" \
+  "$ROOT/ci/h6.config" 2>&1 | tail -40
+make ARCH=arm64 CROSS_COMPILE="$CROSS" O=out olddefconfig 2>&1 | tail -25
 log "--- key config values ---"
-grep -E 'CONFIG_(ACCESS_TOKENID|BINDER_SENDER_INFO|FS_VERITY|EROFS_FS|ANDROID_BINDERFS|QCOM_KGSL|CRYPTO_ECDSA|CRYPTO_ECC|BLK_DEV_LOOP)=' out/.config >> "$REPORT" || true
-grep -E 'CONFIG_(ACCESS_TOKENID|BINDER_SENDER_INFO|FS_VERITY|EROFS_FS|ANDROID_BINDERFS|QCOM_KGSL|CRYPTO_ECDSA)=' out/.config || true
+grep -E 'CONFIG_(ARCH_QCOM|COMPAT|ACCESS_TOKENID|BINDER_SENDER_INFO|FS_VERITY|EROFS_FS|ANDROID_BINDERFS|QCOM_KGSL|CRYPTO_ECDSA|CRYPTO_ECC|BLK_DEV_LOOP)=' out/.config >> "$REPORT" || true
+grep -E 'CONFIG_(ARCH_QCOM|COMPAT|ACCESS_TOKENID|BINDER_SENDER_INFO|FS_VERITY|EROFS_FS|QCOM_KGSL|CRYPTO_ECDSA)=' out/.config || true
 
 log "=== 5. build Image + dtbs ==="
 make ARCH=arm64 CROSS_COMPILE="$CROSS" O=out -j"$(nproc)" Image dtbs 2>&1 | tee "$ROOT/build.log"
