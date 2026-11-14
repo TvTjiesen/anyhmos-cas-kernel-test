@@ -48,6 +48,10 @@ jobs:
           sha256sum art/Image | awk '{print $1}' > stage/Image.sha256
           echo "${{ inputs.label }}" > stage/LABEL
           split -b 4000000 -d -a 2 stage/Image.gz stage/part_
+          # the build report is the only readable trace of a run: the Actions
+          # log endpoint is unreachable from the workstation
+          cp art/apply-report.txt stage/apply-report.txt || true
+          cp art/kernel.config    stage/kernel.config    || true
           ls -l stage
           cd stage
           git init -q
