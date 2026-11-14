@@ -105,11 +105,34 @@ make -j"$(nproc)" O=out ARCH=arm64 CROSS_COMPILE="$CROSS" \
 RC=${PIPESTATUS[0]}
 log "build rc=$RC"
 
-log "=== 6. collect artifacts ==="
+log "=== 6. collect experiment artifacts (BEFORE touching the config) ==="
 cp out/arch/arm64/boot/Image.gz-dtb "$ART/Image.gz-dtb" 2>/dev/null || log "WARN no Image.gz-dtb"
 cp out/arch/arm64/boot/Image "$ART/Image" 2>/dev/null || log "WARN no Image"
 find out/arch/arm64/boot -name '*.dtb' -exec cp {} "$ART/" \; 2>/dev/null || true
 cp out/.config "$ART/kernel.config" 2>/dev/null || true
+
+log "=== 6b. build a GATEKEEPER kernel without a pstore console ==="
+# Every H6 reset lands in the gatekeeper, which boots for ~2 s. A normal
+# kernel registers a pstore console and overwrites the H6 kernel's last ~30 s
+# of console -- the only record of why H6 rebooted. Disabling just
+# CONFIG_PSTORE_CONSOLE makes the gatekeeper leave that reserved RAM alone.
+# NOTE: the boot image header/cmdline are NOT modified. Editing the cmdline
+# makes the cas bootloader reject the image with "Load Error" (proven twice).
+scripts/config --file out/.config -d PSTORE_CONSOLE
+make O=out ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig 2>&1 | tail -10
+log "gatekeeper PSTORE_CONSOLE = $(grep -E '^CONFIG_PSTORE_CONSOLE=' out/.config || echo 'not set')"
+cp out/.config "$ART/kernel-gatekeeper.config"
+make -j"$(nproc)" O=out ARCH=arm64 CROSS_COMPILE="$CROSS" \
+  KCFLAGS="-Wno-error -Wno-attribute-alias" Image 2>&1 | tee "$ROOT/build-gate.log"
+GRC=${PIPESTATUS[0]}
+log "gatekeeper build rc=$GRC"
+if [ -f out/arch/arm64/boot/Image ]; then
+  cp out/arch/arm64/boot/Image "$ART/Image-gatekeeper"
+  log "Image-gatekeeper: $(stat -c %s "$ART/Image-gatekeeper") bytes"
+else
+  log "WARN no Image-gatekeeper"
+fi
 cp "$REPORT" "$ART/apply-report.txt"
 log "artifacts:"; ls -la "$ART"
-exit "$RC"
+if [ "$RC" -ne 0 ] || [ "$GRC" -ne 0 ]; then exit 1; fi
+exit 0
