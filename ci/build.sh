@@ -77,6 +77,29 @@ else:
     print('[build] WARN dma-buf pattern not found; left unchanged')
 PY
 
+log "=== 3c. bake a USB serial console into the kernel command line ==="
+# `console=ttyGS0` is what fills gserial_cons.index; without it every gs port is
+# rejected by gs_console_connect() ("port num [N] is not support console") and
+# not one byte reaches the cable. The boot image header is deliberately NOT
+# touched -- editing its cmdline made the cas bootloader answer "Load Error"
+# twice -- the token is appended to the DT bootargs inside
+# early_init_dt_scan_chosen() instead, so only the kernel binary changes.
+python3 - <<'PY'
+p = 'drivers/of/fdt.c'
+s = open(p, encoding='utf-8', errors='replace').read()
+old = 'strlcpy(data, p, min((int)l, COMMAND_LINE_SIZE));'
+add = 'strlcat(data, " console=ttyGS0,115200 ignore_loglevel", COMMAND_LINE_SIZE);'
+if 'console=ttyGS0' in s:
+    print('[build] console token already present')
+elif old in s:
+    s = s.replace(old, old + '\n\t\t' + add, 1)
+    open(p, 'w', encoding='utf-8', newline='').write(s)
+    print('[build] console=ttyGS0 appended to DT bootargs')
+else:
+    print('[build] WARN fdt.c pattern not found -- console token NOT added')
+PY
+grep -n "console=ttyGS0" drivers/of/fdt.c | tee -a "$REPORT" || log "WARN no console token in fdt.c"
+
 log "=== 4. configure: base defconfig -> fragments -> scripts/config ==="
 make O=out ARCH=arm64 CROSS_COMPILE="$CROSS" vendor/kona-perf_defconfig 2>&1 | tail -15
 export KCONFIG_CONFIG="$PWD/out/.config"
