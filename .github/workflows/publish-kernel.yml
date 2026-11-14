@@ -45,8 +45,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release delete "${{ inputs.tag }}" --yes --cleanup-tag || true
-          gh release create "${{ inputs.tag }}" \
+          gh release delete "${{ inputs.tag }}" --repo "${{ github.repository }}" --yes --cleanup-tag || true
+          gh release create "${{ inputs.tag }}" --repo "${{ github.repository }}" \
             art/Image art/kernel.config art/apply-report.txt \
             --title "${{ inputs.tag }}" \
             --notes "kernel Image + .config + build report for run ${{ inputs.run_id }}"
