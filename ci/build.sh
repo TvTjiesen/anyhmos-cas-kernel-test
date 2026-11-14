@@ -93,10 +93,12 @@ scripts/config --file out/.config \
   -e PKCS7_MESSAGE_PARSER -e X509_CERTIFICATE_PARSER \
   -e EROFS_FS -e EROFS_FS_XATTR -e EROFS_FS_SECURITY \
   -e BLK_DEV_LOOP -e PID_NS -e USER_NS -e FAIR_GROUP_SCHED \
-  -e QCOM_KGSL 2>&1 | tail -20
+  -e QCOM_KGSL   -e U_SERIAL_CONSOLE -e USB_G_SERIAL -e USB_ACM -e USB_CONFIGFS_ACM 2>&1 | tail -20
 make O=out ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig 2>&1 | tail -15
 log "--- key config values ---"
 grep -E 'CONFIG_(ARCH_QCOM|COMPAT|ACCESS_TOKENID|BINDER_SENDER_INFO|FS_VERITY|EROFS_FS|ANDROID_BINDERFS|QCOM_KGSL|CRYPTO_ECDSA|CRYPTO_ECC|BLK_DEV_LOOP)=' out/.config >> "$REPORT" || true
+# USB gadget serial console: this is how the 6.7 s -> reset window becomes visible.
+grep -E 'CONFIG_(U_SERIAL_CONSOLE|USB_G_SERIAL|USB_ACM|USB_CONFIGFS_ACM|USB_CONFIGFS)=' out/.config >> "$REPORT" || true
 grep -E 'CONFIG_(ARCH_QCOM|COMPAT|ACCESS_TOKENID|BINDER_SENDER_INFO|FS_VERITY|EROFS_FS|QCOM_KGSL|CRYPTO_ECDSA)=' out/.config || true
 
 log "=== 5. build Image.gz-dtb ==="
