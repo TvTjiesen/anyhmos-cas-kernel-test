@@ -48,6 +48,35 @@ find . -name '*.rej' -print >> "$REPORT" || true
 log "total .rej files: $(find . -name '*.rej' | wc -l)"
 git status --short | head -120 >> "$REPORT" || true
 
+log "=== 3b. overlay the repaired crypto/ecc.c ==="
+# y2q patch 0005 was generated against the Samsung 4.19 tree. On the Xiaomi
+# tree three ecc.c hunks fail; the missing one carries the #endif closing the
+# CONFIG_ARCH_SUPPORTS_INT128 block, which produced "unterminated #else" and
+# truncated the file at line 346 in CI round 3. A locally reproduced, fully
+# applied and balanced ecc.c is shipped as an overlay so patch context drift
+# can no longer break it.
+cp "$ROOT/ci/overlay/crypto/ecc.c" crypto/ecc.c
+rm -f crypto/ecc.c.rej drivers/dma-buf/dma-buf.c.rej
+log "ecc.c overlay: $(wc -l < crypto/ecc.c) lines, $(grep -c 'add_128_128' crypto/ecc.c) add_128_128 refs"
+
+# The one remaining .rej (0003) removes a duplicate spin_lock in
+# dma_buf_set_name(). It does not break the build but can deadlock a CPU at
+# runtime (y2q A2). Apply it by exact text replacement, guarded.
+python3 - <<'PY'
+p = 'drivers/dma-buf/dma-buf.c'
+s = open(p, encoding='utf-8', errors='replace').read()
+old = ("\tspin_lock(&dmabuf->name_lock);\n"
+       "\tkfree(dmabuf->name);\n"
+       "\tdmabuf->name = name;\n"
+       "\tspin_unlock(&dmabuf->name_lock);\n")
+new = "\tkfree(dmabuf->name);\n\tdmabuf->name = name;\n"
+if old in s:
+    open(p, 'w', encoding='utf-8', newline='').write(s.replace(old, new, 1))
+    print('[build] dma-buf duplicate spin_lock removed')
+else:
+    print('[build] WARN dma-buf pattern not found; left unchanged')
+PY
+
 log "=== 4. configure: base defconfig -> fragments -> scripts/config ==="
 make O=out ARCH=arm64 CROSS_COMPILE="$CROSS" vendor/kona-perf_defconfig 2>&1 | tail -15
 export KCONFIG_CONFIG="$PWD/out/.config"
