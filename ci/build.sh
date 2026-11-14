@@ -131,6 +131,15 @@ scripts/config --file out/.config \
   -d FB -d DRM_FBDEV_EMULATION -d DRM_FBDEV_LEAK_PHYS_SMEM \
   -d LOGO -d FB_MSM -d FB_SIMPLE -d FB_VIRTUAL -d FB_KMS_HELPER 2>&1 | tail -20
 
+log "=== 4b3. lockup detectors (a dead spin is currently invisible) ==="
+# kona-perf_defconfig leaves CONFIG_SOFTLOCKUP_DETECTOR off, so a CPU stuck in
+# a driver loop prints nothing at all before the board resets -- exactly what
+# 6b and 6c look like. With the detectors on, the watchdog prints the stack of
+# whatever is spinning, which beats guessing.
+scripts/config --file out/.config \
+  -e LOCKUP_DETECTOR -e SOFTLOCKUP_DETECTOR -e HARDLOCKUP_DETECTOR \
+  -e DETECT_HUNG_TASK -e DEBUG_KERNEL 2>&1 | tail -20
+
 log "=== 4c. drop the in-tree legacy msm driver (kona uses techpack SDE) ==="
 # Enabling CONFIG_DRM_MSM also pulls in drivers/gpu/drm/msm, the *old*
 # DPU1/MDP4/MDP5 HDMI/eDP driver. It is not what kona's mdss node binds to
@@ -149,6 +158,55 @@ if old not in s:
     raise SystemExit(1)
 open(p, 'w', encoding='utf-8', newline='').write(s.replace(old, new, 1))
 print('[build] legacy drm/msm objects disabled')
+PY
+
+log "=== 4d. instrument the techpack display probe path ==="
+# round 6b/6c both freeze the board: identical to run 9 for 3.18 s, then 28 s of
+# total silence, preinit's first line at 31.8 s, hard reset at 32 s, no panic
+# and no watchdog line (CONFIG_SOFTLOCKUP_DETECTOR is off in kona-perf, so a
+# dead spin is invisible). Removing fbdev changed nothing, so the suspect is
+# the techpack display driver itself. pr_err markers cost one round and turn
+# "silence" into "the last stage we entered", which names the stuck call.
+python3 - <<'PY' || { log "FATAL could not instrument techpack display"; exit 3; }
+import re
+p = 'techpack/display/msm/msm_drv.c'
+s = open(p, encoding='utf-8').read()
+
+def mark_before(anchor, tag):
+    """Insert pr_err(tag) immediately before the line containing anchor."""
+    global s
+    i = s.find(anchor)
+    if i < 0:
+        print('[build] WARN anchor missing: ' + anchor)
+        return
+    ls = s.rfind('\n', 0, i) + 1
+    indent = re.match(r'[ \t]*', s[ls:]).group(0)
+    line = indent + 'pr_err("[CAS] ' + tag + '\\n");\n'
+    s = s[:ls] + line + s[ls:]
+
+mark_before('if (!modeset)', 'drm_register: enter')
+mark_before('msm_smmu_driver_init();', 'drm_register: smmu_init')
+mark_before('msm_dsi_register();', 'drm_register: dsi_register')
+mark_before('msm_edp_register();', 'drm_register: edp_register')
+mark_before('msm_hdmi_register();', 'drm_register: hdmi_register')
+mark_before('return platform_driver_register(&msm_platform_driver);',
+            'drm_register: pdev_register')
+mark_before('ret = add_display_components(&pdev->dev, &match);',
+            'pdev_probe: add_display_components')
+mark_before('return component_master_add_with_match(&pdev->dev, &msm_drm_ops, match);',
+            'pdev_probe: component_master_add')
+mark_before('return msm_drm_init(dev, &msm_driver);', 'bind: msm_drm_bind')
+mark_before('ddev = drm_dev_alloc(drv, dev);', 'init: drm_dev_alloc')
+mark_before('ret = msm_mdss_init(ddev);', 'init: msm_mdss_init')
+mark_before('ret = sde_power_resource_init(pdev, &priv->phandle);', 'init: sde_power_resource_init')
+mark_before('ret = sde_dbg_init(&pdev->dev);', 'init: sde_dbg_init')
+mark_before('ret = msm_component_bind_all(dev, ddev);', 'init: component_bind_all')
+mark_before('kms = _msm_drm_init_helper(priv, ddev, dev, pdev);', 'init: _msm_drm_init_helper')
+mark_before('ret = drm_irq_install(ddev, platform_get_irq(pdev, 0));', 'init: drm_irq_install')
+
+n = s.count('pr_err("[CAS] ')
+open(p, 'w', encoding='utf-8', newline='').write(s)
+print('[build] instrumentation markers inserted: %d' % n)
 PY
 
 make O=out ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig 2>&1 | tail -15
