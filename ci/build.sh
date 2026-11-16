@@ -122,7 +122,14 @@ scripts/config --file out/.config \
   -e PKCS7_MESSAGE_PARSER -e X509_CERTIFICATE_PARSER \
   -e EROFS_FS -e EROFS_FS_XATTR -e EROFS_FS_SECURITY \
   -e BLK_DEV_LOOP -e PID_NS -e USER_NS -e FAIR_GROUP_SCHED \
-  -e QCOM_KGSL   -e U_SERIAL_CONSOLE -e USB_G_SERIAL -e USB_ACM -e USB_CONFIGFS_ACM   -e SECURITY_SELINUX_BOOTPARAM -e SECURITY_SELINUX_DISABLE   --set-str CMDLINE "cgroup_disable=pressure ramoops_memreserve=4M console=ttyGS0,115200 ignore_loglevel selinux=0 initcall_debug" 2>&1 | tail -20
+  -e QCOM_KGSL   -e U_SERIAL_CONSOLE -e USB_G_SERIAL -e USB_ACM -e USB_CONFIGFS_ACM   -e SECURITY_SELINUX_DISABLE   --set-str CMDLINE "cgroup_disable=pressure ramoops_memreserve=4M console=ttyGS0,115200 ignore_loglevel initcall_debug" 2>&1 | tail -20
+# round-046: DO NOT put selinux=0 on the cmdline and DO NOT enable
+# SECURITY_SELINUX_BOOTPARAM. With BOOTPARAM=y + selinux=0 the kernel calls
+# selinux_disable() early: selinuxfs never mounts, load_policy fails, and every
+# HarmonyOS service dies in setexeccon() with EINVAL -> _exit(21) ->
+# foundation critical -> ExecReboot panic at +55s (round-045 evidence).
+# We keep the kernel SELinux active but permissive (DEVELOP=y defaults to 0)
+# and shadow /sys/fs/selinux/enforce in preinit, so setcon/setexeccon work.
 log "=== 4b. enable the SDE/MDSS display stack ==="
 # round-026: the running kernel has CONFIG_DRM_MSM unset, so cas' mdss@1c00000
 # node has no driver at all -- zero msm_drm lines in kmsg, no /dev/dri/card0,
