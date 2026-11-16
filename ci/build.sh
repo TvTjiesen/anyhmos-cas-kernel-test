@@ -85,11 +85,15 @@ log "=== 3d. inject CASDBG diagnostics into lookup_bdev() ==="
 # (via kern_path); every other branch is ENOTBLK/EACCES/ENOMEM. Print them all
 # so one boot names the exact failing branch instead of another guess.
 python3 "$ROOT/ci/patch_lookup_bdev_dbg.py" 2>&1 | tee -a "$REPORT"
-if ! grep -q "CASDBG injected" "$REPORT"; then
-  log "FATAL could not inject lookup_bdev diagnostics (pattern drift?)"
+python3 "$ROOT/ci/patch_mount_dbg.py" 2>&1 | tee -a "$REPORT"
+# round-044 showed lookup_bdev() is never reached, so do_mount()/do_new_mount()
+# now carry their own prints to find which pre-step returns ENOENT.
+if ! grep -q "CASDBG injected: 2 sites in fs/block_dev.c" "$REPORT" || \
+   ! grep -q "CASDBG injected: 6 sites in fs/namespace.c" "$REPORT"; then
+  log "FATAL CASDBG injection incomplete (pattern drift?)"
   exit 3
 fi
-log "lookup_bdev diagnostics armed"
+log "CASDBG armed: lookup_bdev + do_mount + do_new_mount"
 
 log "=== 3c. bake a USB serial console into the kernel command line ==="
 # `console=ttyGS0` is what fills gserial_cons.index; without it every gs port is
