@@ -59,6 +59,16 @@ PAIRS = [
      "\tif (!type)\n\t\treturn -ENODEV;\n"),
 
     # 6) vfs_get_tree result + effective fc->source
+    ("do_new_mount: source parse result",
+     "\tif (!err && name)\n"
+     "\t\terr = vfs_parse_fs_string(fc, \"source\", name, strlen(name));\n"
+     "\tif (!err)\n\t\terr = parse_monolithic_mount_data(fc, data);\n",
+     "\tif (!err && name)\n"
+     "\t\terr = vfs_parse_fs_string(fc, \"source\", name, strlen(name));\n"
+     "\tpr_err(\"CASDBG new_mount: post_source err=%d source='%s' name='%s'\\n\",\n"
+     "\t       err, fc->source ? fc->source : \"(null)\", name ? name : \"(null)\");\n"
+     "\tif (!err)\n\t\terr = parse_monolithic_mount_data(fc, data);\n"),
+
     ("do_new_mount: vfs_get_tree",
      "\tif (!err)\n\t\terr = parse_monolithic_mount_data(fc, data);\n"
      "\tif (!err)\n\t\terr = vfs_get_tree(fc);\n"

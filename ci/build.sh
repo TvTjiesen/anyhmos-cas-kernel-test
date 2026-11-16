@@ -89,7 +89,7 @@ python3 "$ROOT/ci/patch_mount_dbg.py" 2>&1 | tee -a "$REPORT"
 # round-044 showed lookup_bdev() is never reached, so do_mount()/do_new_mount()
 # now carry their own prints to find which pre-step returns ENOENT.
 if ! grep -q "CASDBG injected: 2 sites" "$REPORT" || \
-   ! grep -q "CASDBG injected: 6 sites" "$REPORT"; then
+   ! grep -q "CASDBG injected: 7 sites" "$REPORT"; then
   log "FATAL CASDBG injection incomplete (pattern drift?)"
   exit 3
 fi
