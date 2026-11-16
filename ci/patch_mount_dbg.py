@@ -69,13 +69,20 @@ PAIRS = [
      "\t       err, fc->source ? fc->source : \"(null)\", name ? name : \"(null)\");\n"
      "\tif (!err)\n\t\terr = parse_monolithic_mount_data(fc, data);\n"),
 
-    ("do_new_mount: vfs_get_tree",
+    ("do_new_mount: vfs_get_tree + FORCE source",
      "\tif (!err)\n\t\terr = parse_monolithic_mount_data(fc, data);\n"
      "\tif (!err)\n\t\terr = vfs_get_tree(fc);\n"
      "\tif (!err)\n\t\terr = do_new_mount_fc(fc, path, mnt_flags);\n",
      "\tif (!err)\n\t\terr = parse_monolithic_mount_data(fc, data);\n"
      "\tpr_err(\"CASDBG new_mount: pre_tree err=%d source='%s'\\n\",\n"
      "\t       err, fc->source ? fc->source : \"(null)\");\n"
+     "\t/* CASDBG fix: re-assert the verified device name before get_tree.\n"
+     "\t * Round-044 proved fc->source is NULL here even when name is a valid\n"
+     "\t * /dev/sdX path, so mount_bdev() gets no device and returns ENOENT. */\n"
+     "\tif (!err && !fc->source && name) {\n"
+     "\t\tpr_err(\"CASDBG new_mount: FORCE source='%s'\\n\", name);\n"
+     "\t\tfc->source = kstrdup(name, GFP_KERNEL);\n"
+     "\t}\n"
      "\tif (!err)\n\t\terr = vfs_get_tree(fc);\n"
      "\tpr_err(\"CASDBG new_mount: vfs_get_tree=%d\\n\", err);\n"
      "\tif (!err)\n\t\terr = do_new_mount_fc(fc, path, mnt_flags);\n"),
