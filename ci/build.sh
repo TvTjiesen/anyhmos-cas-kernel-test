@@ -77,6 +77,20 @@ else:
     print('[build] WARN dma-buf pattern not found; left unchanged')
 PY
 
+log "=== 3d. inject CASDBG diagnostics into lookup_bdev() ==="
+# Decisive probe for the H6 mount-ENOENT mystery. On this kernel mount() returns
+# ENOENT for EVERY block-device path (see reports/round-041..043), while the
+# 4.19.157 recovery kernel mounts the same partition fine and open()/lstat()
+# work. fs/block_dev.c:lookup_bdev() is the only site that can yield ENOENT
+# (via kern_path); every other branch is ENOTBLK/EACCES/ENOMEM. Print them all
+# so one boot names the exact failing branch instead of another guess.
+python3 "$ROOT/ci/patch_lookup_bdev_dbg.py" 2>&1 | tee -a "$REPORT"
+if ! grep -q "CASDBG injected" "$REPORT"; then
+  log "FATAL could not inject lookup_bdev diagnostics (pattern drift?)"
+  exit 3
+fi
+log "lookup_bdev diagnostics armed"
+
 log "=== 3c. bake a USB serial console into the kernel command line ==="
 # `console=ttyGS0` is what fills gserial_cons.index; without it every gs port is
 # rejected by gs_console_connect() ("port num [N] is not support console") and
